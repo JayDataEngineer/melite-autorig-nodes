@@ -37,6 +37,17 @@ if not log.handlers:
 
 SOMA_SKIN_PATH = "/opt/kimodo/kimodo/assets/skeletons/somaskel77/skin_standard.npz"
 
+# The somaskel77 UV layout — per-vertex (u, v) of the SAME 18056-vert
+# template, lifted once from the estate's somax body export (the game's
+# base body GLB shares the template topology and carries its atlas UVs,
+# which span [-1.86, 5.18] — tiled/repeat, NOT unit-square; never clamp).
+# Transferring THESE onto the rigged source keeps one-texture-fits-all:
+# any body that leaves this bridge is paintable by the somax skin maps
+# (SkinApply refuses bodies without TEXCOORD_0 — caught live 2026-09-06
+# when the character flow's coat stage met the ANNY body: POSITION only).
+SOMA_UV_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "somaskel77_uv.npy")
+
 # ═══════════════════════════════════════════════════════════════════════════
 # CANONICAL POSE REFERENCE — see docs/CANONICAL-SOMAX-POSE.md
 # ═══════════════════════════════════════════════════════════════════════════
@@ -492,8 +503,22 @@ def transfer_soma_weights_and_write_glb(
     soma_lbs_w = soma["lbs_weights"].astype(np.float32)          # (18056, 8)
     soma_joint_names = list(soma["rig_joint_names"])             # 77
     soma_bind = soma["bind_rig_transform"].astype(np.float32)    # (77, 4, 4)
-    log.info("[soma_xfer] template: %d verts, %d joints",
-             len(soma_verts), len(soma_joint_names))
+    # UV layout ships WITH the pack (see SOMA_UV_PATH). Missing/mismatched
+    # layout downgrades to no UV transfer (weights are unaffected) — the
+    # run then fails only if a downstream consumer needs UVs, loudly.
+    soma_uv: np.ndarray | None = None
+    try:
+        _uv = np.load(SOMA_UV_PATH).astype(np.float32)
+        if _uv.shape == (len(soma_verts), 2):
+            soma_uv = _uv
+        else:
+            log.warning("[soma_xfer] %s shape %s != (%d, 2) — UV transfer skipped",
+                        SOMA_UV_PATH, _uv.shape, len(soma_verts))
+    except (OSError, ValueError) as _e:
+        log.warning("[soma_xfer] somaskel77 UV layout unavailable (%s) — UV transfer skipped", _e)
+    log.info("[soma_xfer] template: %d verts, %d joints, uv=%s",
+             len(soma_verts), len(soma_joint_names),
+             soma_uv.shape if soma_uv is not None else None)
 
     # ── Load source GLB ────────────────────────────────────────────────
     gltf, bin_data = _read_glb(source_path)
@@ -771,6 +796,21 @@ def transfer_soma_weights_and_write_glb(
     # ears). These should be 0, not negative.
     per_joint_w = np.clip(per_joint_w, 0.0, None)
     log.info("[soma_xfer] weight interpolation done in %.1fs", time.time() - t_xfer)
+
+    # ── Somax UV transfer (same barycentric pass, TEXCOORD not JOINTS) ──
+    # P3 (fabricated tet apex) carries its triangle's mean UV, exactly as
+    # it carries the triangle's mean weight. Values are NOT clamped: the
+    # layout is a tiled atlas, and off-surface extrapolation may legitimately
+    # land a hair's-breadth outside a tile — repeat wrap absorbs it.
+    src_uv: np.ndarray | None = None
+    if soma_uv is not None:
+        _face_avg_uv = soma_uv[soma_faces].mean(axis=1)              # (n_faces, 2)
+        _uv_padded = np.concatenate([soma_uv, _face_avg_uv], axis=0)  # (V+F, 2)
+        src_uv = np.zeros((n_src, 2), dtype=np.float32)
+        for _k in range(4):
+            src_uv += _bary[:, _k:_k + 1] * _uv_padded[_tet[:, _k]]
+        log.info("[soma_xfer] uv transfer done: range [%.3f, %.3f]",
+                 float(src_uv.min()), float(src_uv.max()))
 
     # ── Finger weight containment ─────────────────────────────────────
     # Barycentric extrapolation assigns finger joint weights (Thumb, Index,
@@ -1311,6 +1351,7 @@ def transfer_soma_weights_and_write_glb(
         source_pos=src_pos,
         joints=top_idx.astype(np.uint16),
         weights=top_w.astype(np.float32),
+        src_uv=src_uv,
         soma_joint_names=soma_joint_names,
         soma_bind_aligned=soma_bind_aligned,
         output_path=output_path,
@@ -1345,6 +1386,7 @@ def _write_rigged_glb(
     output_path: str,
     t_align: np.ndarray | None = None,  # (4, 4) SOMA-template → source-mesh transform
     preserve_texture: bool = True,
+    src_uv: np.ndarray | None = None,    # (N, 2) somax-layout UVs for the source verts
 ) -> None:
     """Write a new GLB = source geometry/textures + skin weights + armature.
 
@@ -1498,6 +1540,19 @@ def _write_rigged_glb(
     prim = gltf["meshes"][0]["primitives"][0]
     prim["attributes"]["JOINTS_0"] = acc_j
     prim["attributes"]["WEIGHTS_0"] = acc_w
+
+    # ── TEXCOORD_0 (float32 vec2, somax layout) ────────────────────────
+    # Only when the source primitive has NO UVs of its own: a body that
+    # arrives with UVs keeps them (its textures live in that space). The
+    # somax layout spans beyond [0,1] (tiled atlas) — min/max stated from
+    # the data, never clamped.
+    if src_uv is not None and "TEXCOORD_0" not in prim["attributes"]:
+        uv_bytes = src_uv.astype(np.float32).tobytes()
+        bv_uv = add_bufferView(uv_bytes)
+        acc_uv = add_accessor(bv_uv, n_verts, "VEC2", 5126,
+                              mins=[float(src_uv[:, 0].min()), float(src_uv[:, 1].min())],
+                              maxs=[float(src_uv[:, 0].max()), float(src_uv[:, 1].max())])
+        prim["attributes"]["TEXCOORD_0"] = acc_uv
 
     # ── IBM buffer created later, after scale-stripping + FK recompute ──
 

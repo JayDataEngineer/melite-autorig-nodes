@@ -564,9 +564,13 @@ class KimodoExportFBX:
         if source_glb:
             source_glb = _resolve_path("source_glb", source_glb)
 
-        # ── Resolve Blender binary ──────────────────────────────────────
-        blender_bin = _resolve_blender_binary()
-        log.info("KimodoExportFBX: blender=%s", blender_bin)
+        # ── Blender binary: resolved LAZILY at the branches that run it ──
+        # (2026-09-06, the anny→kimodo bridge): the standalone-rig path
+        # (source_glb + glb format) is pure python+torch — resolving
+        # Blender here unconditionally refused headless estates with no
+        # Blender installed, BEFORE the no-Blender branch could run. A
+        # Blender branch that actually runs resolves (and raises) at
+        # its own site — the refusal names the real requirement.
 
         # ── Choose action based on inputs ───────────────────────────────
         # Priority: rig_and_retarget (source+NPZ) > retarget (NPZ) >
@@ -675,8 +679,9 @@ class KimodoExportFBX:
                 # FBX: convert the GLB via Blender (format conversion only,
                 # no weight computation)
                 script_path = os.path.join(_nodes_dir, "blender_convert.py")
+                _blender_bin = _resolve_blender_binary()
                 cmd = [
-                    blender_bin, "--background", "--python", script_path,
+                    _blender_bin, "--background", "--python", script_path,
                     "--", glb_output, output_path, "fbx",
                 ]
                 log.info("KimodoExportFBX: FBX convert: %s", " ".join(cmd))
@@ -728,9 +733,10 @@ class KimodoExportFBX:
                 f"KimodoExportFBX: {action} script not found: {script_path}"
             )
 
+        _blender_bin = _resolve_blender_binary()
         if action == "retarget":
             cmd = [
-                blender_bin,
+                _blender_bin,
                 "--background",
                 "--python",
                 script_path,
@@ -745,7 +751,7 @@ class KimodoExportFBX:
             ]
         else:
             cmd = [
-                blender_bin,
+                _blender_bin,
                 "--background",
                 "--python",
                 script_path,
