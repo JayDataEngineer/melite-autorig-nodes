@@ -1,0 +1,8 @@
+# melite-autorig-nodes — deps BEYOND the engine base env.
+# Blender is NOT a dependency of this file: bpy/mathutils run
+# inside the `blender -b` subprocess the pack shells out to (the
+# binary is the operator's — env SKINTOKEN_BLENDER_BIN/BLENDER_BIN
+# then PATH, loud failure at node time).
+trimesh
+scipy
+requests
