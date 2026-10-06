@@ -299,6 +299,18 @@ def validate_glb(glb_path, verbose=True):
 
 
 if __name__ == '__main__':
+    from report_sidecar import write_report
     glb_path = sys.argv[-1] if len(sys.argv) > 1 else '/tmp/onetool_output.glb'
     passed, violations, stats = validate_glb(glb_path)
+    # THE BENCH REPORT SIDECAR (2026-10-17): the verdict lands beside
+    # the GLB as the adapter's 3-tuple JSON, so the runs seat mounts
+    # it inline on the stage row (reports — the bench result
+    # contract). Exit codes stay the validator's own (0 pass / 1
+    # fail); a sidecar that cannot write exits 2 — distinct from both,
+    # because a silent skip would read as a validation that never ran.
+    try:
+        write_report(glb_path, passed, violations, stats)
+    except OSError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(2)
     sys.exit(0 if passed else 1)
