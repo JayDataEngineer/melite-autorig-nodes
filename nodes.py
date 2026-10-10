@@ -195,23 +195,35 @@ def _mimo_validate(glb_path: str, num_frames: int = 4) -> dict | None:
         return None
 
 
-# ── Blender binary resolution (mirrors SkinToken's _resolve_blender_binary) ──
+# ── Blender binary resolution (the ONE law, shared verbatim with
+# melite-poser-nodes/blender_render.py — features/008 M13, cured
+# 2026-10-21; the old copy mirrored the foreign SkinToken pack's
+# env var and refused to fall back to the portable copy) ─────────
 def _resolve_blender_binary() -> str:
     """Find the Blender headless binary.
 
-    Priority:
-      1. SKINTOKEN_BLENDER_BIN env var (shared with SkinToken)
+    Priority (one law, both melite packs that shell Blender):
+      1. BLENDER_BIN env var
       2. PATH lookup via shutil.which
+      3. the ray repo's portable Blender (host-clone topology:
+         no system blender, no /usr/local write access)
+      4. LOUD FileNotFoundError — never a bare "blender" string
+         that dies later at subprocess spawn with a worse error.
     """
-    env_path = os.environ.get("SKINTOKEN_BLENDER_BIN") or os.environ.get("BLENDER_BIN")
+    env_path = os.environ.get("BLENDER_BIN")
     if env_path and os.path.isfile(env_path):
         return env_path
     discovered = shutil.which("blender")
     if discovered:
         return discovered
+    from pathlib import Path
+    portable = Path.home() / "Documents/programs/ray/scratch/blender/blender-4.2.5-linux-x64/blender"
+    if portable.is_file():
+        return str(portable)
     raise FileNotFoundError(
-        "Blender binary not found. Set SKINTOKEN_BLENDER_BIN or ensure "
-        "'blender' is on PATH."
+        "Blender binary not found. Set BLENDER_BIN, put 'blender' on "
+        "PATH, or provide the portable copy at "
+        f"{portable}"
     )
 
 
