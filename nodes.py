@@ -258,7 +258,7 @@ class LoadGLBAsTrimesh:
     RETURN_TYPES = ("TRIMESH",)
     RETURN_NAMES = ("trimesh",)
     FUNCTION = "load"
-    CATEGORY = "TechNoir/AutoRig"
+    CATEGORY = "Melite/AutoRig"
     OUTPUT_NODE = False
 
     def load(self, glb_path: str):
@@ -352,7 +352,7 @@ class SaveRiggedModel:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("rigged_path",)
     FUNCTION = "save"
-    CATEGORY = "TechNoir/AutoRig"
+    CATEGORY = "Melite/AutoRig"
     OUTPUT_NODE = True
 
     def save(self, rigged_path: str):
@@ -514,7 +514,7 @@ class KimodoExportFBX:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("animated_path",)
     FUNCTION = "export"
-    CATEGORY = "TechNoir/AutoRig"
+    CATEGORY = "Melite/AutoRig"
     OUTPUT_NODE = True
 
     def export(
@@ -919,7 +919,7 @@ class KimodoTransferWeights:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("output_path",)
     FUNCTION = "transfer"
-    CATEGORY = "TechNoir/AutoRig"
+    CATEGORY = "Melite/AutoRig"
     OUTPUT_NODE = True
 
     def transfer(self, rigged_path: str, target_path: str):
@@ -1070,7 +1070,7 @@ class RaySyncSiblingWeights:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("output_path",)
     FUNCTION = "sync"
-    CATEGORY = "TechNoir/AutoRig"
+    CATEGORY = "Melite/AutoRig"
     OUTPUT_NODE = True
 
     def sync(self, rigged_glb_path: str):
@@ -1114,7 +1114,7 @@ class RayCleanWeights:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("output_path",)
     FUNCTION = "clean"
-    CATEGORY = "TechNoir/AutoRig"
+    CATEGORY = "Melite/AutoRig"
     OUTPUT_NODE = True
 
     def clean(self, rigged_glb_path: str):
@@ -1187,7 +1187,7 @@ class SomaNPZToOpenPose:
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("openpose_image",)
     FUNCTION = "render"
-    CATEGORY = "TechNoir/AutoRig"
+    CATEGORY = "Melite/AutoRig"
     OUTPUT_NODE = True
 
     def render(self, npz_path: str, frame_index: int = 0, img_size: int = 768):
