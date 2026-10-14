@@ -363,7 +363,14 @@ class SaveRiggedModel:
         # extract_media silently skips the rigged GLB.
         subdir = ""
         if rigged_path:
-            output_base = os.path.join(os.environ.get("COMFYUI_ROOT", "/root/ComfyUI"), "output")
+            import folder_paths
+            # THE OUTPUT-DIR TRUTH (weight-suite receipt 2026-10-31:
+            # the copy/transfer lanes executed on silicon but nothing
+            # harvested — COMFYUI_ROOT is unset under the service
+            # launch, the /root/ComfyUI fallback escaped to "..",
+            # subdir fell "", and /view 404'd the 3D/ file. The
+            # engine's own folder_paths owns the base — no env).
+            output_base = folder_paths.get_output_directory()
             try:
                 rel = os.path.relpath(rigged_path, output_base)
                 parent = os.path.dirname(rel)
