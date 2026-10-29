@@ -9,8 +9,12 @@ import numpy as np
 import json
 import struct
 import math
+import os
 import sys
-sys.path.insert(0, '/root/ComfyUI/custom_nodes/melite-autorig-nodes')
+# Pack-local sibling import (audit 019 C6): the hardcoded
+# /root/ComfyUI layout died on any other install — this file's own
+# directory is the one home the sibling module always shares.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from soma_weight_transfer import _aabb_align_uniform, _read_glb, SOMA_SKIN_PATH
 
 SOMA77_PARENTS = (

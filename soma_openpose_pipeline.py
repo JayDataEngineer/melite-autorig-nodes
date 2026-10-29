@@ -66,8 +66,10 @@ def step_1_openpose(output_path):
     print("="*60)
     script = os.path.join(SCRIPT_DIR, "soma_to_openpose.py")
     if not os.path.exists(script):
-        # Generate inline
-        sys.path.insert(0, "/tmp")
+        # Generate inline — the sibling module, when present at all,
+        # lives in THIS pack dir (audit 019 C6: the "/tmp" guess was
+        # a foreign-layout crutch; SCRIPT_DIR is the one shared home).
+        sys.path.insert(0, SCRIPT_DIR)
         from soma_to_openpose import load_soma_tpose, soma_to_openpose_image
         tpose = load_soma_tpose()
         soma_to_openpose_image(tpose, output_path)
