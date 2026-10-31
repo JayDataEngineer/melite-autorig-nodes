@@ -110,6 +110,44 @@ def _estimate_similarity_transform(
 
 # ── Main entry point ────────────────────────────────────────────────────
 
+def _transfer_chunk_size(n_src: int) -> int:
+    """One cdist tile width: the NN loop's own budget (500M cells ≈
+    2GB float32) divided by the donor width. Single home for the
+    budget the loop and the VRAM pre-flight share."""
+    return max(256, min(8192, 500_000_000 // max(n_src, 1)))
+
+
+def _require_transfer_headroom(n_src: int, n_tgt: int) -> None:
+    """Refuse loud when the transfer's peak working set cannot fit free
+    VRAM — F39b's keyless half: a raw CUDA OOM traceback names no
+    cure, so name the class instead (a resident 14GB-class loader +
+    the transfer weights + one cdist tile exceed the card). Call with
+    the device already known CUDA; CPU transfers skip VRAM by law."""
+    import torch
+    positions = (n_src + n_tgt) * 3 * 4  # float32 xyz, both meshes resident
+    tile = _transfer_chunk_size(n_src) * n_src * 4  # one cdist tile, float32
+    required = int((positions + tile) * 1.1)  # 10% allocator headroom
+    free, total = torch.cuda.mem_get_info()
+    if required <= free:
+        log.info("[gpu_transfer] VRAM pre-flight: need ~%.2f GB, free %.2f GB — go",
+                 required / 1e9, free / 1e9)
+        return
+    raise RuntimeError(
+        "transfer_weights: REFUSING instead of OOMing — the transfer "
+        "needs ~%.2f GB free VRAM (donor %d verts → target %d verts: "
+        "one ~%.2f GB cdist tile) but only %.2f GB of %.2f GB is free. "
+        "The donor loader's own weights are the usual resident "
+        "(the 14GB KimodoAnimated + 4.9GB transfer-weights class that "
+        "burned a 24GB card solo). Cures, cheapest first: use the "
+        "SOMA-rigged CLEAN mesh as the donor instead of the full "
+        "animated export (fewer donor verts shrink the tile); wire "
+        "MeliteUnload(unload_models=True) ahead of this node; or "
+        "restart the engine and run the transfer first. GPU-side "
+        "fitting verification stays owed."
+        % (required / 1e9, n_src, n_tgt, tile / 1e9,
+           free / 1e9, total / 1e9))
+
+
 def transfer_weights_and_write_glb(
     rigged_path: str,
     source_path: str,
@@ -135,6 +173,27 @@ def transfer_weights_and_write_glb(
     rigged_prim = rigged_gltf["meshes"][0]["primitives"][0]
     ra = rigged_prim["attributes"]
 
+    # ── Donor schema pre-flight (F39a): a donor mesh without a skin
+    # carries no JOINTS_0/WEIGHTS_0 — the bare subscript died as
+    # KeyError 'JOINTS_0' naming neither the file nor the cure. Refuse
+    # loud: the transfer copies the rig FROM a SOMA-rigged clean mesh
+    # ONTO the clothed mesh, so the donor MUST be the SOMA-rigged
+    # file (an estimator/raw export with no joint schema cannot
+    # donate a rig — SOMA-rig it first).
+    for _attr in ("POSITION", "JOINTS_0", "WEIGHTS_0"):
+        if _attr not in ra:
+            raise ValueError(
+                "transfer_weights: donor rigged GLB %r has no %s "
+                "attribute — wire the SOMA-rigged clean mesh into "
+                "rigged_path (this file carries no joint schema to "
+                "donate)." % (rigged_path, _attr))
+    sa_preview = source_gltf["meshes"][0]["primitives"][0]["attributes"]
+    if "POSITION" not in sa_preview:
+        raise ValueError(
+            "transfer_weights: target GLB %r has no POSITION attribute — "
+            "wire the clothed mesh geometry into source_path."
+            % (source_path,))
+
     rigged_pos = _read_accessor(rigged_gltf, rigged_bin, ra["POSITION"]).astype(np.float32)
     rigged_joints = _read_accessor(rigged_gltf, rigged_bin, ra["JOINTS_0"]).astype(np.int32)
     rigged_weights = _read_accessor(rigged_gltf, rigged_bin, ra["WEIGHTS_0"]).astype(np.float32)
@@ -153,14 +212,20 @@ def transfer_weights_and_write_glb(
     rigged_aligned = (T @ rigged_h.T).T[:, :3]
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        # ── VRAM pre-flight (F39b): the 14GB Kimodo loader + 4.9GB
+        # transfer weights OOM'd a 24GB card even solo — a raw CUDA
+        # OOM traceback names no cure. Refuse loud when the peak
+        # working set cannot fit, naming free vs required and the
+        # donor-scale-down cure; GPU-side verification stays owed.
+        _require_transfer_headroom(n_src, n_tgt)
     src_tensor = torch.from_numpy(rigged_aligned.astype(np.float32)).to(device)
     tgt_tensor = torch.from_numpy(source_pos.astype(np.float32)).to(device)
 
     indices = np.empty(n_tgt, dtype=np.int64)
 
     if device == "cuda":
-        max_cells = 500_000_000  # ~2GB / 4 bytes
-        chunk_size = max(256, min(8192, max_cells // max(n_src, 1)))
+        chunk_size = _transfer_chunk_size(n_src)
     else:
         chunk_size = 128
 

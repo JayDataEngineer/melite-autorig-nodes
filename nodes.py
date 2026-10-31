@@ -968,6 +968,26 @@ class KimodoTransferWeights:
         rigged_path = _resolve_path("rigged_path", rigged_path)
         target_path = _resolve_path("target_path", target_path)
 
+        # ── VRAM yield (F39b: the 14GB Kimodo loader + 4.9GB transfer
+        # weights OOM'd a 24GB card even solo — a previous brick's
+        # ComfyUI-resident models starve the transfer's cdist tiles).
+        # Same law as KimodoLoader and the Voice Studio: evict
+        # ComfyUI residents BEFORE the heavy alloc. Loud when the
+        # seat is missing — a transfer that cannot yield must not
+        # run blind into an OOM traceback.
+        try:
+            import comfy.model_management as _mm
+        except ImportError as exc:
+            raise RuntimeError(
+                "KimodoTransferWeights: comfy.model_management is "
+                "unavailable — the transfer cannot yield VRAM before "
+                "its GPU nearest-neighbor pass: %s" % exc
+            ) from exc
+        _mm.unload_all_models()
+        _mm.soft_empty_cache()
+        log.info("KimodoTransferWeights: evicted ComfyUI-resident "
+                 "models before the transfer")
+
         # ── Build output path ───────────────────────────────────────────
         output_dir = folder_paths.get_output_directory()
         ts = int(time.time())
