@@ -85,26 +85,33 @@ _MIMO_PROMPT = (
     '"frame_ratings": [N,...], "issues": "...", "summary": "..."}'
 )
 
-# MIMO API credentials — REQUIRED. Load from env (config/secrets.env).
-# No hardcoded fallback by design: a missing key must fail loudly, not
-# silently use a leaked secret committed to the repo.
-_MIMO_API_KEY = os.environ.get("MIMO_API_KEY")
-_MIMO_HEADERS = {
-    "Authorization": f"Bearer {_MIMO_API_KEY}",
-    "Content-Type": "application/json",
-    "User-Agent": "Mozilla/5.0",
-}
+# MIMO API credentials — REQUIRED, and a NODE INPUT, never env.
+# VENDOR RE-CURE (2026-11-01) — COMFYUI EXTENSION NEVER USE ENV
+# VARIABLES. The MIMO_API_KEY env seat is retired (a missing key must
+# fail loudly naming the input, not silently use a leaked secret
+# committed to the repo — and never read process env to find one).
+def _mimo_headers(api_key: str) -> dict:
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0",
+    }
 
 
-def _mimo_validate(glb_path: str, num_frames: int = 4) -> dict | None:
+def _mimo_validate(
+    glb_path: str, api_key: str = "", num_frames: int = 4,
+    blender_bin: str = "",
+) -> dict | None:
     """Render frames from GLB and ask MIMO-2.5 if the output is body horror.
 
     Returns dict with overall_rating, verdict, frame_ratings, issues, summary.
     Returns None on total failure (non-fatal — generation still succeeds).
+    The API key rides the ``mimo_api_key`` node input; the Blender binary
+    rides ``blender_bin`` — never process env.
     """
     import base64
 
-    blender_bin = _resolve_blender_binary()
+    blender_bin = _resolve_blender_binary(blender_bin)
     script_path = os.path.join(os.path.dirname(glb_path), "_mimo_render.py")
     out_dir = os.path.join(os.path.dirname(glb_path), "_mimo_frames")
 
@@ -142,12 +149,15 @@ def _mimo_validate(glb_path: str, num_frames: int = 4) -> dict | None:
 
     try:
         import requests
-        if not _MIMO_API_KEY:
-            log.error("MIMO_API_KEY env var not set — cannot validate. See config/secrets.env.example.")
+        if not (api_key or "").strip():
+            log.error(
+                "MIMO validation skipped — wire the 'mimo_api_key' "
+                "node input to enable it.")
             return None
+        headers = _mimo_headers((api_key or "").strip())
         resp = requests.post(
             "https://opencode.ai/zen/go/v1/chat/completions",
-            headers=_MIMO_HEADERS,
+            headers=headers,
             json={
                 "model": "mimo-v2.5",
                 "messages": [{"role": "user", "content": content}],
@@ -167,7 +177,7 @@ def _mimo_validate(glb_path: str, num_frames: int = 4) -> dict | None:
             log.warning("MIMO returned None content (reasoning ate all tokens), retrying with higher limit")
             resp = requests.post(
                 "https://opencode.ai/zen/go/v1/chat/completions",
-                headers=_MIMO_HEADERS,
+                headers=headers,
                 json={
                     "model": "mimo-v2.5",
                     "messages": [{"role": "user", "content": content}],
@@ -199,20 +209,22 @@ def _mimo_validate(glb_path: str, num_frames: int = 4) -> dict | None:
 # melite-poser-nodes/blender_render.py — features/008 M13, cured
 # 2026-10-21; the old copy mirrored the foreign SkinToken pack's
 # env var and refused to fall back to the portable copy) ─────────
-def _resolve_blender_binary() -> str:
+def _resolve_blender_binary(explicit: str = "") -> str:
     """Find the Blender headless binary.
 
-    Priority (one law, both melite packs that shell Blender):
-      1. BLENDER_BIN env var
+    VENDOR RE-CURE (2026-11-01) — COMFYUI EXTENSION NEVER USE ENV
+    VARIABLES. The BLENDER_BIN env seat is retired (the shared one law
+    with melite-poser-nodes/blender_render.py — features/008 M13, cured
+    2026-10-21 — minus its env leg). Priority:
+      1. the ``blender_bin`` node input (explicit path)
       2. PATH lookup via shutil.which
       3. the ray repo's portable Blender (host-clone topology:
          no system blender, no /usr/local write access)
       4. LOUD FileNotFoundError — never a bare "blender" string
          that dies later at subprocess spawn with a worse error.
     """
-    env_path = os.environ.get("BLENDER_BIN")
-    if env_path and os.path.isfile(env_path):
-        return env_path
+    if (explicit or "").strip() and os.path.isfile((explicit or "").strip()):
+        return (explicit or "").strip()
     discovered = shutil.which("blender")
     if discovered:
         return discovered
@@ -221,9 +233,10 @@ def _resolve_blender_binary() -> str:
     if portable.is_file():
         return str(portable)
     raise FileNotFoundError(
-        "Blender binary not found. Set BLENDER_BIN, put 'blender' on "
-        "PATH, or provide the portable copy at "
-        f"{portable}"
+        "Blender binary not found. Wire the 'blender_bin' node input, "
+        "put 'blender' on PATH, or provide the portable copy at "
+        f"{portable} (BLENDER_BIN env is retired: this pack never "
+        "reads process env)."
     )
 
 
@@ -515,6 +528,30 @@ class KimodoExportFBX:
                         ),
                     },
                 ),
+                # VENDOR RE-CURE: the Blender binary + MIMO key ride node
+                # inputs, never env (BLENDER_BIN / MIMO_API_KEY retired).
+                "blender_bin": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": (
+                            "Explicit Blender binary path (defaults to "
+                            "PATH lookup, then the portable copy)."
+                        ),
+                    },
+                ),
+                "mimo_api_key": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": (
+                            "MIMO API key for the non-fatal body-horror "
+                            "visual validation (empty = skip validation)."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -534,6 +571,8 @@ class KimodoExportFBX:
         in_place: bool = True,
         decimate_ratio: float = 0.2,
         preserve_texture: bool = True,
+        blender_bin: str = "",
+        mimo_api_key: str = "",
     ):
         if not rigged_path and not source_glb:
             raise ValueError(
@@ -698,7 +737,7 @@ class KimodoExportFBX:
                 # FBX: convert the GLB via Blender (format conversion only,
                 # no weight computation)
                 script_path = os.path.join(_nodes_dir, "blender_convert.py")
-                _blender_bin = _resolve_blender_binary()
+                _blender_bin = _resolve_blender_binary(blender_bin)
                 cmd = [
                     _blender_bin, "--background", "--python", script_path,
                     "--", glb_output, output_path, "fbx",
@@ -752,7 +791,7 @@ class KimodoExportFBX:
                 f"KimodoExportFBX: {action} script not found: {script_path}"
             )
 
-        _blender_bin = _resolve_blender_binary()
+        _blender_bin = _resolve_blender_binary(blender_bin)
         if action == "retarget":
             cmd = [
                 _blender_bin,
@@ -844,7 +883,9 @@ class KimodoExportFBX:
         # NOTE: ComfyUI serializes UI dicts to list(keys), so we JSON-encode
         # the validation result as a string to survive the round-trip.
         try:
-            validation = _mimo_validate(output_path)
+            validation = _mimo_validate(
+                output_path, api_key=mimo_api_key,
+                blender_bin=blender_bin)
             if validation:
                 # ComfyUI converts dict→list(keys) and str→list(chars).
                 # Wrap in a list to survive: ComfyUI preserves list-of-dict
