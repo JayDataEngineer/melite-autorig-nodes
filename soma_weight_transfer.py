@@ -64,7 +64,7 @@ SOMA_UV_PATH = os.path.join(
 # ═══════════════════════════════════════════════════════════════════════════
 
 # SOMA-77 index → Mixamo short-name (without "mixamorig:" prefix).
-# Mirrors blender_retarget.py's SOMA_TO_MIXAMO. Bones NOT in this map are
+# SOMA_TO_MIXAMO. Bones NOT in this map are
 # emitted as-is (e.g. eyes, jaw, fingers after 3rd joint) but the retarget
 # script will skip them if absent.
 SOMA_IDX_TO_MIXAMO_NAME: dict[int, str] = {
@@ -125,7 +125,7 @@ SOMA_IDX_TO_MIXAMO_NAME: dict[int, str] = {
 }
 
 # Mixamo parent map (short names, no "mixamorig:" prefix).
-# Same as blender_retarget.py expects.
+# The rig output's bone order.
 MIXAMO_PARENT_OF: dict[str, str | None] = {
     "Hips": None,
     "Spine": "Hips",
@@ -179,7 +179,7 @@ MIXAMO_PARENT_OF: dict[str, str | None] = {
     "RightHandPinky3": "RightHandPinky2",  "RightHandPinky4": "RightHandPinky3",
 }
 
-# SOMA-77 parent index array (mirrors blender_retarget.py SOMA77_PARENTS).
+# SOMA-77 parent index array (SOMA77_PARENTS).
 SOMA77_PARENTS = (
     None,                                          # 0 Hips
     0,                                             # 1 Spine1

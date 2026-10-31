@@ -6,9 +6,10 @@ Nodes:
   SaveRiggedModel — OUTPUT_NODE that captures the rigged_path STRING and
     returns it with 3D-preview UI data. Without this, SkinTokenRigTrimesh's
     output is invisible to ComfyUI's response (it lacks OUTPUT_NODE=True).
-  KimodoExportFBX — takes a rigged character (Mixamo bones, from Step 1 or
-    any source) + a SOMA-77 motion NPZ (from KimodoTextToPose) and produces
-    an animated FBX/GLB via Blender headless retargeting.
+  KimodoExportFBX — transfers the SOMA-77 template's hand-painted LBS
+    weights onto a source mesh and writes the rigged GLB (the node writes
+    itself; GLB is the only format — the FBX/retarget arms died with the
+    blender lane).
   KimodoTransferWeights — copies the rig + skin weights from a SOMA-rigged
     CLEAN mesh onto a CLOTHED mesh (same body, AI-generated clothing/hair).
     Uses GPU KNN (torch.cdist). The clothing step of the character pipeline.
@@ -21,223 +22,10 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-import subprocess
 import time
 import json as _json
 
 log = logging.getLogger(__name__)
-
-
-# ── MIMO-2.5 visual validation ──────────────────────────────────────────────
-# Renders frames from the output GLB and sends them to MIMO-2.5 vision API
-# to check for body horror.  The user never discovers bad output manually.
-
-_MIMO_RENDER_SCRIPT = r"""
-import bpy, sys, os
-glb_path = sys.argv[-3]
-out_dir  = sys.argv[-2]
-n        = int(sys.argv[-1])
-os.makedirs(out_dir, exist_ok=True)
-bpy.ops.wm.read_factory_settings(use_empty=True)
-s = bpy.context.scene
-s.render.engine = 'BLENDER_EEVEE_NEXT'
-s.render.resolution_x = 384; s.render.resolution_y = 512
-s.eevee.taa_render_samples = 16
-bpy.ops.import_scene.gltf(filepath=glb_path)
-arm = next((o for o in bpy.data.objects if o.type == 'ARMATURE'), None)
-acts = bpy.data.actions
-if arm and acts:
-    ad = arm.animation_data or arm.animation_data_create()
-    ad.action = acts[0]
-    fs = max(1, int(acts[0].frame_range[0]))
-    fe = max(fs+1, int(acts[0].frame_range[1]))
-    step = max(1, (fe - fs) // n)
-else:
-    fs, fe, step = 0, 0, 1
-cd = bpy.data.cameras.new("C"); cd.lens = 50
-c = bpy.data.objects.new("C", cd); c.location = (0,-3.5,1.2); c.rotation_euler = (1.4,0,0)
-bpy.context.collection.objects.link(c); s.camera = c
-for nm,loc,e in [("K",(3,-3,5),800),("F",(-3,-2,3),300)]:
-    L = bpy.data.lights.new(nm, type='AREA'); L.energy=e; L.size=5
-    o = bpy.data.objects.new(nm, L); o.location = loc
-    bpy.context.collection.objects.link(o)
-w = bpy.data.worlds.new("W"); w.use_nodes = True
-w.node_tree.nodes["Background"].inputs[0].default_value = (0.15,0.15,0.2,1)
-w.node_tree.nodes["Background"].inputs[1].default_value = 1.0
-s.world = w
-for i in range(n):
-    f = fs + i*step if arm and acts else 0
-    s.frame_set(f); bpy.context.view_layer.update()
-    s.render.filepath = os.path.join(out_dir, f"f{i:03d}.png")
-    bpy.ops.render.render(write_still=True)
-print(f"RENDERED:{n}")
-"""
-
-_MIMO_PROMPT = (
-    "You are a 3D animation quality reviewer. These frames are from an "
-    "animated 3D character. Check for BODY HORROR: limbs bending in "
-    "impossible directions, joints dislocated, mesh inside-out, character "
-    "melting/collapsing, severe texture stretching.\n\n"
-    "Rate each frame 1-10 (10=perfect, 1=unwatchable). "
-    "Overall verdict: PASS (>=6) or FAIL.\n"
-    "Respond ONLY as JSON: "
-    '{"overall_rating": N, "verdict": "PASS|FAIL", '
-    '"frame_ratings": [N,...], "issues": "...", "summary": "..."}'
-)
-
-# MIMO API credentials — REQUIRED, and a NODE INPUT, never env.
-# VENDOR RE-CURE (2026-11-01) — COMFYUI EXTENSION NEVER USE ENV
-# VARIABLES. The MIMO_API_KEY env seat is retired (a missing key must
-# fail loudly naming the input, not silently use a leaked secret
-# committed to the repo — and never read process env to find one).
-def _mimo_headers(api_key: str) -> dict:
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0",
-    }
-
-
-def _mimo_validate(
-    glb_path: str, api_key: str = "", num_frames: int = 4,
-    blender_bin: str = "",
-) -> dict | None:
-    """Render frames from GLB and ask MIMO-2.5 if the output is body horror.
-
-    Returns dict with overall_rating, verdict, frame_ratings, issues, summary.
-    Returns None on total failure (non-fatal — generation still succeeds).
-    The API key rides the ``mimo_api_key`` node input; the Blender binary
-    rides ``blender_bin`` — never process env.
-    """
-    import base64
-
-    blender_bin = _resolve_blender_binary(blender_bin)
-    script_path = os.path.join(os.path.dirname(glb_path), "_mimo_render.py")
-    out_dir = os.path.join(os.path.dirname(glb_path), "_mimo_frames")
-
-    with open(script_path, "w") as f:
-        f.write(_MIMO_RENDER_SCRIPT)
-
-    os.makedirs(out_dir, exist_ok=True)
-    for old in os.listdir(out_dir):
-        old_path = os.path.join(out_dir, old)
-        if os.path.isfile(old_path):
-            os.remove(old_path)
-
-    cmd = [blender_bin, "--background", "--python", script_path,
-           "--", glb_path, out_dir, str(num_frames)]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-    if proc.returncode != 0:
-        log.warning("MIMO render failed: %s", proc.stderr[-300:])
-        return None
-
-    frame_paths = sorted(
-        os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.endswith(".png")
-    )
-    if not frame_paths:
-        log.warning("MIMO render produced no frames")
-        return None
-
-    content = [{"type": "text", "text": _MIMO_PROMPT}]
-    for fp in frame_paths:
-        with open(fp, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{b64}"},
-        })
-
-    try:
-        import requests
-        if not (api_key or "").strip():
-            log.error(
-                "MIMO validation skipped — wire the 'mimo_api_key' "
-                "node input to enable it.")
-            return None
-        headers = _mimo_headers((api_key or "").strip())
-        resp = requests.post(
-            "https://opencode.ai/zen/go/v1/chat/completions",
-            headers=headers,
-            json={
-                "model": "mimo-v2.5",
-                "messages": [{"role": "user", "content": content}],
-                "max_tokens": 4096,
-                "temperature": 0.1,
-            },
-            timeout=60,
-        )
-        if resp.status_code != 200:
-            log.warning("MIMO API %d: %s", resp.status_code, resp.text[:200])
-            return None
-        text = resp.json()["choices"][0]["message"]["content"]
-        if text is None:
-            # MIMO-2.5 is a reasoning model — if max_tokens is too low, all
-            # tokens are consumed by reasoning and content is None. Bump
-            # the limit and retry so reasoning + content both fit.
-            log.warning("MIMO returned None content (reasoning ate all tokens), retrying with higher limit")
-            resp = requests.post(
-                "https://opencode.ai/zen/go/v1/chat/completions",
-                headers=headers,
-                json={
-                    "model": "mimo-v2.5",
-                    "messages": [{"role": "user", "content": content}],
-                    "max_tokens": 4096,
-                    "temperature": 0.1,
-                },
-                timeout=90,
-            )
-            if resp.status_code != 200:
-                log.warning("MIMO retry failed %d: %s", resp.status_code, resp.text[:200])
-                return None
-            text = resp.json()["choices"][0]["message"]["content"]
-            if text is None:
-                log.warning("MIMO still None content after retry")
-                return None
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[-1]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-        return _json.loads(text)
-    except Exception as e:
-        log.warning("MIMO API call failed: %s", e)
-        return None
-
-
-# ── Blender binary resolution (the ONE law, shared verbatim with
-# melite-poser-nodes/blender_render.py — features/008 M13, cured
-# 2026-10-21; the old copy mirrored the foreign SkinToken pack's
-# env var and refused to fall back to the portable copy) ─────────
-def _resolve_blender_binary(explicit: str = "") -> str:
-    """Find the Blender headless binary.
-
-    VENDOR RE-CURE (2026-11-01) — COMFYUI EXTENSION NEVER USE ENV
-    VARIABLES. The BLENDER_BIN env seat is retired (the shared one law
-    with melite-poser-nodes/blender_render.py — features/008 M13, cured
-    2026-10-21 — minus its env leg). Priority:
-      1. the ``blender_bin`` node input (explicit path)
-      2. PATH lookup via shutil.which
-      3. the ray repo's portable Blender (host-clone topology:
-         no system blender, no /usr/local write access)
-      4. LOUD FileNotFoundError — never a bare "blender" string
-         that dies later at subprocess spawn with a worse error.
-    """
-    if (explicit or "").strip() and os.path.isfile((explicit or "").strip()):
-        return (explicit or "").strip()
-    discovered = shutil.which("blender")
-    if discovered:
-        return discovered
-    from pathlib import Path
-    portable = Path.home() / "Documents/programs/ray/scratch/blender/blender-4.2.5-linux-x64/blender"
-    if portable.is_file():
-        return str(portable)
-    raise FileNotFoundError(
-        "Blender binary not found. Wire the 'blender_bin' node input, "
-        "put 'blender' on PATH, or provide the portable copy at "
-        f"{portable} (BLENDER_BIN env is retired: this pack never "
-        "reads process env)."
-    )
 
 
 class LoadGLBAsTrimesh:
@@ -407,148 +195,64 @@ class SaveRiggedModel:
 
 
 class KimodoExportFBX:
-    """Apply SOMA-77 motion data onto a rigged character → animated FBX/GLB.
+    """Transfer the SOMA-77 template's hand-painted LBS weights onto a
+    source mesh and write the rigged GLB.
 
-    Takes a rigged character file (GLB or FBX with Mixamo bone names —
-    typically the output of SkinTokenRigTrimesh from Step 1) and a SOMA-77
-    motion NPZ (from KimodoTextToPose), then retargets the motion onto the
-    character's skeleton via Blender headless.
+    The node IS the output capture: it writes the GLB itself and returns
+    its path (the bench mounts the three_model preview). No format
+    conversion, no motion retarget, no Blender — the FBX/retarget arms
+    and the MIMO visual validation rode headless Blender subprocesses and
+    were deleted with the blender lane (operator 2026-11-01: melite
+    carries no blender — it rides the DSH profiles). GLB is the only
+    output format; motion rides the kimodo family's RaySomaxBake path.
 
-    The retargeting uses position-based direction matching:
-      For each bone, compute the rotation that aligns the bone's rest
-      direction to the posed direction (derived from NPZ joint positions).
-    Root translation is scaled to match the armature's proportions.
-
-    Output: animated FBX (for Unity/Unreal/Kimodo) or GLB (for web/Three.js).
+    Pipeline (NVIDIA SOMA-X SOTA):
+      1. AABB-align SOMA template mesh into source mesh space
+         (uniform scale via height ratio + axis permutation)
+      2. BarycentricInterpolator: for each source vertex, find its
+         containing triangle in the T_align'd SOMA template mesh.
+         Interpolate the template's hand-painted weights via the
+         triangle's barycentric coords. This preserves the template's
+         anatomically-correct weight boundaries EXACTLY — structurally
+         eliminating the torso/arm "wing" artifact that bone-heat
+         smoothing caused on raised-arm motions.
+      3. Cross-body decontamination (prune L↔R contamination on
+         inner thighs, collar bones) + top-4 influence selection.
+      4. Write GLB with Mixamo-named joints + correct IBMs.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "rigged_path": (
-                    "STRING",
-                    {
-                        "default": "",
-                        "multiline": False,
-                        "tooltip": (
-                            "Path to a rigged GLB/FBX with Mixamo bone names. "
-                            "Connect from SaveRiggedModel or provide a path."
-                        ),
-                        "forceInput": True,
-                    },
-                ),
-                "fps": (
-                    "INT",
-                    {
-                        "default": 30,
-                        "min": 1,
-                        "max": 120,
-                        "tooltip": "Output animation frame rate.",
-                    },
-                ),
-                "file_format": (
-                    ["fbx", "glb"],
-                    {
-                        "default": "fbx",
-                        "tooltip": (
-                            "FBX for Unity/Unreal/Kimodo. "
-                            "GLB for web/Three.js."
-                        ),
-                    },
-                ),
-            },
-            "optional": {
-                "npz_path": (
-                    "STRING",
-                    {
-                        "default": "",
-                        "multiline": False,
-                        "tooltip": (
-                            "Optional: SOMA-77 motion NPZ for retargeting. "
-                            "If provided, Blender retargets motion onto the "
-                            "character. If empty, just converts format."
-                        ),
-                        "forceInput": True,
-                    },
-                ),
-                "in_place": (
-                    "BOOLEAN",
-                    {
-                        "default": True,
-                        "tooltip": (
-                            "In-place motion: zero root horizontal drift so "
-                            "character walks on a treadmill (stays centered). "
-                            "Recommended for Pose Studio."
-                        ),
-                    },
-                ),
-                "decimate_ratio": (
-                    "FLOAT",
-                    {
-                        "default": 0.2,
-                        "min": 0.0,
-                        "max": 1.0,
-                        "step": 0.05,
-                        "tooltip": (
-                            "Mesh decimation ratio (0=off, 0.2=reduce to 20%% "
-                            "of faces). Uses Collapse mode which preserves "
-                            "skin weights. Reduces file size ~70%%."
-                        ),
-                    },
-                ),
                 "source_glb": (
                     "STRING",
                     {
                         "default": "",
                         "multiline": False,
                         "tooltip": (
-                            "Optional: original textured GLB. When provided "
-                            "(and no npz_path), GPU transfers the rig + skin "
-                            "weights from rigged_path onto THIS mesh, "
-                            "preserving textures. Uses AABB-aligned "
-                            "torch.cdist nearest-neighbor on the RTX 4090 "
-                            "(~10s for 500K verts) and writes the GLB "
-                            "directly — no Blender involved."
+                            "Original textured GLB to rig. The SOMA-77 "
+                            "template's weights transfer onto THIS mesh "
+                            "(AABB-aligned torch.cdist nearest-neighbor on "
+                            "the RTX 4090, ~10s for 500K verts) and the "
+                            "rigged GLB is written directly."
                         ),
                         "forceInput": True,
                     },
                 ),
+            },
+            "optional": {
                 "preserve_texture": (
                     "BOOLEAN",
                     {
                         "default": True,
                         "tooltip": (
-                            "SOMAX standalone mode only. When True (default), "
-                            "the output GLB keeps the source mesh's textures. "
-                            "When False, all textures are stripped and the "
-                            "mesh is given a flat SOMA-blue material — useful "
-                            "when you want to apply textures later in Pose "
-                            "Studio or an external tool. Ignored for retarget."
-                        ),
-                    },
-                ),
-                # VENDOR RE-CURE: the Blender binary + MIMO key ride node
-                # inputs, never env (BLENDER_BIN / MIMO_API_KEY retired).
-                "blender_bin": (
-                    "STRING",
-                    {
-                        "default": "",
-                        "multiline": False,
-                        "tooltip": (
-                            "Explicit Blender binary path (defaults to "
-                            "PATH lookup, then the portable copy)."
-                        ),
-                    },
-                ),
-                "mimo_api_key": (
-                    "STRING",
-                    {
-                        "default": "",
-                        "multiline": False,
-                        "tooltip": (
-                            "MIMO API key for the non-fatal body-horror "
-                            "visual validation (empty = skip validation)."
+                            "When True (default), the output GLB keeps the "
+                            "source mesh's textures. When False, all "
+                            "textures are stripped and the mesh is given a "
+                            "flat SOMA-blue material — useful when you want "
+                            "to apply textures later in Pose Studio or an "
+                            "external tool."
                         ),
                     },
                 ),
@@ -556,354 +260,97 @@ class KimodoExportFBX:
         }
 
     RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("animated_path",)
+    RETURN_NAMES = ("rigged_path",)
     FUNCTION = "export"
     CATEGORY = "Melite/AutoRig"
     OUTPUT_NODE = True
 
-    def export(
-        self,
-        rigged_path: str,
-        fps: int,
-        file_format: str,
-        npz_path: str = "",
-        source_glb: str = "",
-        in_place: bool = True,
-        decimate_ratio: float = 0.2,
-        preserve_texture: bool = True,
-        blender_bin: str = "",
-        mimo_api_key: str = "",
-    ):
-        if not rigged_path and not source_glb:
+    def export(self, source_glb: str, preserve_texture: bool = True):
+        if not source_glb or not source_glb.strip():
             raise ValueError(
-                "KimodoExportFBX: both rigged_path and source_glb are empty. "
-                "Provide a GLB path (rigged_path for retarget, or source_glb "
-                "for SOMA standalone rigging)."
+                "KimodoExportFBX: source_glb is empty. Provide the GLB to rig."
             )
 
-        rigged_path = rigged_path.strip()
-        npz_path = npz_path.strip() if npz_path else ""
-        source_glb = source_glb.strip() if source_glb else ""
-
-        # Resolve paths: accept absolute paths, ComfyUI input/ filenames,
-        # output/ filenames (with optional subfolder), or relative paths.
-        # This lets the frontend pass a filename from upload_file() without
-        # knowing ComfyUI's internal directory layout.
-        import folder_paths  # ComfyUI core
-        _input_dir = folder_paths.get_input_directory()
-        _output_dir = folder_paths.get_output_directory()
-
-        def _resolve_path(label: str, path: str) -> str:
-            # 1. Absolute path that exists.
-            if os.path.isabs(path) and os.path.isfile(path):
-                return path
-            # 2. Relative to ComfyUI input/ (uploaded files).
-            candidate = os.path.join(_input_dir, path)
-            if os.path.isfile(candidate):
-                return candidate
-            # 3. Relative to ComfyUI output/ (generated files, e.g. "3D/foo.glb").
-            candidate = os.path.join(_output_dir, path)
-            if os.path.isfile(candidate):
-                return candidate
-            # 4. Bare filename in output/ (no subfolder).
-            for root, _dirs, files in os.walk(_output_dir):
-                if path in files:
-                    return os.path.join(root, path)
-            raise FileNotFoundError(
-                f"KimodoExportFBX: {label} not found: {path} "
-                f"(checked abs, input/{path}, output/{path}, output/**/{path})"
-            )
-
-        # rigged_path may be empty in SOMA standalone mode (source_glb only).
-        if rigged_path:
-            rigged_path = _resolve_path("rigged_path", rigged_path)
-        if npz_path:
-            npz_path = _resolve_path("npz_path", npz_path)
-        if source_glb:
-            source_glb = _resolve_path("source_glb", source_glb)
-
-        # ── Blender binary: resolved LAZILY at the branches that run it ──
-        # (2026-09-06, the anny→kimodo bridge): the standalone-rig path
-        # (source_glb + glb format) is pure python+torch — resolving
-        # Blender here unconditionally refused headless estates with no
-        # Blender installed, BEFORE the no-Blender branch could run. A
-        # Blender branch that actually runs resolves (and raises) at
-        # its own site — the refusal names the real requirement.
-
-        # ── Choose action based on inputs ───────────────────────────────
-        # Priority: rig_and_retarget (source+NPZ) > retarget (NPZ) >
-        #           apply_weights (source_glb) > convert
-        _nodes_dir = os.path.dirname(os.path.abspath(__file__))
-        if source_glb and npz_path:
-            action = "rig_and_retarget"
-        elif npz_path:
-            action = "retarget"
-        elif source_glb:
-            action = "apply_weights"
-        else:
-            action = "convert"
-
-        # ── Build output path ───────────────────────────────────────────
         import folder_paths  # ComfyUI core
         output_dir = folder_paths.get_output_directory()
-        ext = "fbx" if file_format.lower() == "fbx" else "glb"
+
+        source_glb = self._resolve_path("source_glb", source_glb.strip())
+
         ts = int(time.time())
-        animated_filename = f"3D/KimodoAnimated_{ts}.{ext}"
-        output_path = os.path.join(output_dir, animated_filename)
+        output_path = os.path.join(output_dir, f"3D/KimodoRigged_{ts}.glb")
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-        # ── Combined mode: SOMA rig THEN retarget motion in one pass ───────
-        # When the user provides BOTH a raw GLB and a motion NPZ, we rig
-        # the mesh first (SOMA weight transfer, ~2s) then immediately
-        # retarget the motion via Blender. This is the ONE-CLICK path:
-        # TRELLIS GLB + motion NPZ → animated character.
-        if action == "rig_and_retarget":
-            import importlib.util
-            _mod_path = os.path.join(_nodes_dir, "soma_weight_transfer.py")
-            _spec = importlib.util.spec_from_file_location(
-                "soma_weight_transfer", _mod_path,
-            )
-            _gpu_mod = importlib.util.module_from_spec(_spec)
-            _spec.loader.exec_module(_gpu_mod)
-
-            temp_rigged = os.path.join(
-                os.path.dirname(output_path), f"_soma_temp_{ts}.glb",
-            )
-            log.info(
-                "KimodoExportFBX: combined mode — SOMA rig → %s, then retarget",
-                os.path.basename(temp_rigged),
-            )
-            _gpu_mod.transfer_soma_weights_and_write_glb(
-                source_path=source_glb, output_path=temp_rigged,
-                preserve_texture=preserve_texture,
-            )
-            log.info("KimodoExportFBX: SOMA rig complete, starting retarget")
-
-            rigged_path = temp_rigged
-            action = "retarget"
-            # Fall through to the retarget logic below
-
-        # ── SOMA template weight transfer (standalone rig mode) ───────────
-        # When source_glb is provided WITHOUT a pre-rigged GLB, we use the
-        # SOMA-77 template body (skin_standard.npz — a pre-rigged human with
-        # hand-painted LBS weights) as the weight source. This REPLACES the
-        # broken SkinToken approach.
-        #
-        # Pipeline (NVIDIA SOMA-X SOTA):
-        #   1. AABB-align SOMA template mesh into source mesh space
-        #      (uniform scale via height ratio + axis permutation)
-        #   2. BarycentricInterpolator: for each source vertex, find its
-        #      containing triangle in the T_align'd SOMA template mesh.
-        #      Interpolate the template's hand-painted weights via the
-        #      triangle's barycentric coords. This preserves the template's
-        #      anatomically-correct weight boundaries EXACTLY — structurally
-        #      eliminating the torso/arm "wing" artifact that bone-heat
-        #      smoothing caused on raised-arm motions.
-        #   3. Cross-body decontamination (prune L↔R contamination on
-        #      inner thighs, collar bones) + top-4 influence selection.
-        #   4. Write GLB with Mixamo-named joints + correct IBMs.
-        if action == "apply_weights":
-            import importlib.util
-            _mod_path = os.path.join(_nodes_dir, "soma_weight_transfer.py")
-            _spec = importlib.util.spec_from_file_location(
-                "soma_weight_transfer", _mod_path,
-            )
-            _gpu_mod = importlib.util.module_from_spec(_spec)
-            _spec.loader.exec_module(_gpu_mod)
-
-            # If FBX requested, write GLB first then convert
-            glb_output = output_path
-            if file_format.lower() == "fbx":
-                glb_output = output_path.replace(".fbx", ".glb")
-
-            log.info(
-                "KimodoExportFBX: SOMA template weight transfer "
-                "(source=%s, no SkinToken — uses /opt/kimodo/.../skin_standard.npz)",
-                os.path.basename(source_glb),
-            )
-            # NEW API: takes only source_path + output_path (no rigged_path
-            # needed — the SOMA template at /opt/kimodo is the weight source).
-            _gpu_mod.transfer_soma_weights_and_write_glb(
-                source_path=source_glb,
-                output_path=glb_output,
-                preserve_texture=preserve_texture,
-            )
-            log.info("KimodoExportFBX: SOMA transfer complete → %s", glb_output)
-
-            if file_format.lower() == "glb":
-                # GLB already written — no Blender needed!
-                output_path = glb_output
-            else:
-                # FBX: convert the GLB via Blender (format conversion only,
-                # no weight computation)
-                script_path = os.path.join(_nodes_dir, "blender_convert.py")
-                _blender_bin = _resolve_blender_binary(blender_bin)
-                cmd = [
-                    _blender_bin, "--background", "--python", script_path,
-                    "--", glb_output, output_path, "fbx",
-                ]
-                log.info("KimodoExportFBX: FBX convert: %s", " ".join(cmd))
-                result = subprocess.run(cmd, capture_output=True,
-                                        text=True, timeout=600)
-                if result.returncode != 0:
-                    raise RuntimeError(
-                        f"KimodoExportFBX: FBX conversion failed "
-                        f"(exit {result.returncode}). "
-                        f"stderr: {result.stderr[-500:]}"
-                    )
-                # Clean up temp GLB
-                if os.path.isfile(glb_output) and glb_output != output_path:
-                    os.remove(glb_output)
-
-            if not os.path.isfile(output_path):
-                raise RuntimeError(
-                    f"KimodoExportFBX: output not created: {output_path}"
-                )
-
-            log.info("KimodoExportFBX: exported %s (%.1f KB)",
-                     output_path, os.path.getsize(output_path) / 1024.0)
-
-            filename = os.path.basename(output_path)
-            subfolder = os.path.relpath(
-                os.path.dirname(output_path), output_dir
-            ) if os.path.dirname(output_path) != output_dir else ""
-
-            return {
-                "result": (output_path,),
-                "ui": {
-                    "three_model": [
-                        {
-                            "filename": filename,
-                            "subfolder": subfolder,
-                            "type": "output",
-                        }
-                    ]
-                },
-            }
-
-        # ── Retarget / Convert: run Blender headless ────────────────────
-        if action == "retarget":
-            script_path = os.path.join(_nodes_dir, "blender_retarget.py")
-        else:
-            script_path = os.path.join(_nodes_dir, "blender_convert.py")
-        if not os.path.isfile(script_path):
-            raise FileNotFoundError(
-                f"KimodoExportFBX: {action} script not found: {script_path}"
-            )
-
-        _blender_bin = _resolve_blender_binary(blender_bin)
-        if action == "retarget":
-            cmd = [
-                _blender_bin,
-                "--background",
-                "--python",
-                script_path,
-                "--",
-                rigged_path,
-                npz_path,
-                output_path,
-                str(fps),
-                file_format.lower(),
-                str(in_place),
-                str(decimate_ratio),
-            ]
-        else:
-            cmd = [
-                _blender_bin,
-                "--background",
-                "--python",
-                script_path,
-                "--",
-                rigged_path,
-                output_path,
-                file_format.lower(),
-            ]
-        log.info("KimodoExportFBX: running %s: %s", action, " ".join(cmd))
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=600,  # 10 min max
+        _nodes_dir = os.path.dirname(os.path.abspath(__file__))
+        import importlib.util
+        _mod_path = os.path.join(_nodes_dir, "soma_weight_transfer.py")
+        _spec = importlib.util.spec_from_file_location(
+            "soma_weight_transfer", _mod_path,
         )
+        _gpu_mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_gpu_mod)
 
-        # Blender prints to both stdout and stderr; log for debugging.
-        if result.stdout:
-            for line in result.stdout.strip().splitlines():
-                if line.strip():
-                    log.info("blender: %s", line.rstrip())
-        if result.stderr:
-            for line in result.stderr.strip().splitlines():
-                stripped = line.rstrip()
-                if any(kw in stripped.lower() for kw in
-                       ("error", "traceback", "exception", "failed")):
-                    log.error("blender: %s", stripped)
-                elif stripped.startswith("Blender"):
-                    log.info("blender: %s", stripped)
-                else:
-                    log.debug("blender stderr: %s", stripped)
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"KimodoExportFBX: Blender failed (exit {result.returncode}). "
-                f"Last stderr: {result.stderr[-500:] if result.stderr else '(empty)'}"
-            )
+        log.info(
+            "KimodoExportFBX: SOMA template weight transfer "
+            "(source=%s — the pack's skin_standard.npz is the weight source)",
+            os.path.basename(source_glb),
+        )
+        _gpu_mod.transfer_soma_weights_and_write_glb(
+            source_path=source_glb,
+            output_path=output_path,
+            preserve_texture=preserve_texture,
+        )
+        log.info("KimodoExportFBX: SOMA transfer complete → %s", output_path)
 
         if not os.path.isfile(output_path):
             raise RuntimeError(
-                f"KimodoExportFBX: output file not created: {output_path}. "
-                f"Blender stdout: {result.stdout[-500:]}"
+                f"KimodoExportFBX: output not created: {output_path}"
             )
 
-        log.info(
-            "KimodoExportFBX: exported %s (%.1f KB)",
-            output_path,
-            os.path.getsize(output_path) / 1024.0,
-        )
+        log.info("KimodoExportFBX: exported %s (%.1f KB)",
+                 output_path, os.path.getsize(output_path) / 1024.0)
 
         filename = os.path.basename(output_path)
         subfolder = os.path.relpath(
             os.path.dirname(output_path), output_dir
         ) if os.path.dirname(output_path) != output_dir else ""
 
-        ui_data = {
-            "three_model": [
-                {
-                    "filename": filename,
-                    "subfolder": subfolder,
-                    "type": "output",
-                }
-            ],
-        }
-
-        # ── MIMO-2.5 visual validation ─────────────────────────────────
-        # Render frames and send to MIMO-2.5 vision API to check for body
-        # horror. The user NEVER has to discover bad output — MIMO catches
-        # it first. Runs in <30s (4 frames EEVEE + API call).
-        # NOTE: ComfyUI serializes UI dicts to list(keys), so we JSON-encode
-        # the validation result as a string to survive the round-trip.
-        try:
-            validation = _mimo_validate(
-                output_path, api_key=mimo_api_key,
-                blender_bin=blender_bin)
-            if validation:
-                # ComfyUI converts dict→list(keys) and str→list(chars).
-                # Wrap in a list to survive: ComfyUI preserves list-of-dict
-                # (see three_model above). Server unwraps on the other side.
-                ui_data["mimo_validation"] = [validation]
-                verdict = validation.get("verdict", "UNKNOWN")
-                rating = validation.get("overall_rating", -1)
-                log.info(
-                    "KimodoExportFBX: MIMO-2.5 verdict=%s rating=%s",
-                    verdict, rating,
-                )
-        except Exception as ve:
-            log.warning("MIMO validation failed (non-fatal): %s", ve)
-
         return {
             "result": (output_path,),
-            "ui": ui_data,
+            "ui": {
+                "three_model": [
+                    {
+                        "filename": filename,
+                        "subfolder": subfolder,
+                        "type": "output",
+                    }
+                ]
+            },
         }
+
+    @staticmethod
+    def _resolve_path(label: str, path: str) -> str:
+        # Accept absolute paths, ComfyUI input/ filenames, output/
+        # filenames (with optional subfolder), or relative paths — the
+        # frontend passes a filename from upload_file() without knowing
+        # ComfyUI's internal directory layout.
+        import folder_paths  # ComfyUI core
+        _input_dir = folder_paths.get_input_directory()
+        _output_dir = folder_paths.get_output_directory()
+        if os.path.isabs(path) and os.path.isfile(path):
+            return path
+        candidate = os.path.join(_input_dir, path)
+        if os.path.isfile(candidate):
+            return candidate
+        candidate = os.path.join(_output_dir, path)
+        if os.path.isfile(candidate):
+            return candidate
+        for root, _dirs, files in os.walk(_output_dir):
+            if path in files:
+                return os.path.join(root, path)
+        raise FileNotFoundError(
+            f"KimodoExportFBX: {label} not found: {path} "
+            f"(checked abs, input/{path}, output/{path}, output/**/{path})"
+        )
 
 
 class KimodoTransferWeights:
@@ -926,7 +373,7 @@ class KimodoTransferWeights:
                             ├─→ KimodoTransferWeights → clothed+rigged GLB
       clothed GLB (no rig) ──┘                                 │
                                                                 ▼
-                                                    KimodoExportFBX (retarget)
+                                                    SaveRiggedModel / KimodoExportFBX
 
     Uses AABB-aligned nearest-neighbor on the GPU (~10s for 500K verts) and
     writes the GLB directly — no Blender involved.

@@ -1,6 +1,6 @@
 # melite-autorig-nodes
 
-rig transfer + weight surgery (KimodoExportFBX, soma_weight_transfer, blender_retarget, validate_rig, weight_surgery).
+rig transfer + weight surgery (KimodoExportFBX, soma_weight_transfer, weight_surgery).
 
 Tech Noir Auto-Rig bridge nodes for ComfyUI.
 

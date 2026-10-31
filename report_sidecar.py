@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """The bench report sidecar (2026-10-17).
 
-validate_rig.py runs under Blender's python (bpy), which the engine
-cannot host — so the validator executes on the blender lane and drops
-its verdict BESIDE the GLB as JSON. The runs seat picks any
+A producer drops its verdict BESIDE the GLB as JSON (the original
+producer, the bpy-based validate_rig.py, left with the blender lane —
+operator 2026-11-01: melite carries no blender; a DSH-profile producer
+owns the verdict run now). The runs seat picks any
 ``<stem>.report.json`` up at status time and mounts it inline on the
 stage row (``reports`` — the bench stage result contract's own
 machine-readable verdict map, never a url, never subject to the

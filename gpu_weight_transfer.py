@@ -1,7 +1,7 @@
 """GPU-accelerated weight transfer — replaces SkinToken's brute-force transfer_rigging.
 
 Does the ENTIRE transfer in the ComfyUI process (GPU available), writing the
-output GLB directly. Blender is only used for FBX conversion if needed.
+output GLB directly (the FBX conversion arm died with the blender lane).
 
 SkinToken's transfer_rigging does:
   1. estimate_similarity_transform (align source→target) — ESSENTIAL for quality
