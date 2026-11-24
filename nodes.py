@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import shutil
 import time
 import json as _json
@@ -294,11 +295,26 @@ class KimodoExportFBX:
             "(source=%s — the pack's skin_standard.npz is the weight source)",
             os.path.basename(source_glb),
         )
-        _gpu_mod.transfer_soma_weights_and_write_glb(
-            source_path=source_glb,
-            output_path=output_path,
-            preserve_texture=preserve_texture,
-        )
+        # Import the judge through the SAME channel the transfer's loader uses
+        # (sys.modules["rig_preflight"]) — a second importlib-by-path load would
+        # mint a distinct RigRefusal class this except could never catch.
+        if _nodes_dir not in sys.path:
+            sys.path.insert(0, _nodes_dir)
+        import rig_preflight
+        try:
+            _gpu_mod.transfer_soma_weights_and_write_glb(
+                source_path=source_glb,
+                output_path=output_path,
+                preserve_texture=preserve_texture,
+            )
+        except rig_preflight.RigRefusal as refusal:
+            measured = "; ".join("%s=%s" % (k, v) for k, v in sorted(refusal.stats.items()))
+            raise ValueError(
+                "KimodoExportFBX refuses this source: "
+                + "; ".join(refusal.violations)
+                + (" (measured: %s)" % measured if measured else "")
+                + " — the auto lane rigs a STANDING humanoid in rest pose; seat it upright or rig by copy instead."
+            ) from refusal
         log.info("KimodoExportFBX: SOMA transfer complete → %s", output_path)
 
         if not os.path.isfile(output_path):

@@ -255,82 +255,6 @@ def _read_accessor(gltf: dict, bin_data: bytes, idx: int) -> np.ndarray:
 # Alignment
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _aabb_align(src_pts: np.ndarray, tgt_pts: np.ndarray) -> np.ndarray:
-    """Compute 4x4 transform mapping src_pts into tgt_pts's AABB.
-
-    Uses bounding-box centering + PER-AXIS scaling so different body
-    proportions (A-pose vs T-pose) still map head-to-head, arm-to-arm.
-    Also permutes axes so src's "up" (largest range) aligns with tgt's up.
-    Returns (4,4) homogeneous transform.
-    """
-    s_min, s_max = src_pts.min(axis=0), src_pts.max(axis=0)
-    t_min, t_max = tgt_pts.min(axis=0), tgt_pts.max(axis=0)
-    s_center = (s_min + s_max) / 2
-    t_center = (t_min + t_max) / 2
-    s_size = np.maximum(s_max - s_min, 1e-8)
-    t_size = np.maximum(t_max - t_min, 1e-8)
-
-    # Axis permutation: rotate src so its "up" (largest range) aligns with
-    # tgt's "up". For human meshes, largest range = height = "up".
-    s_axis_order = np.argsort(-s_size)  # largest first
-    t_axis_order = np.argsort(-t_size)
-    P = np.zeros((3, 3), dtype=np.float32)
-    for i in range(3):
-        P[t_axis_order[i], s_axis_order[i]] = 1.0
-
-    # CRITICAL: A pure axis-swap permutation has det=-1 (reflection).
-    # Force a proper rotation (det=+1) by flipping the smallest-magnitude axis.
-    if np.linalg.det(P) < 0:
-        smallest_src_axis = s_axis_order[-1]
-        smallest_tgt_axis = t_axis_order[-1]
-        P[smallest_tgt_axis, smallest_src_axis] = -1.0
-
-    # Per-axis scale: scale src's permuted axes to match tgt's axes.
-    # s_permuted_size[i] = s_size[s_axis_order[i]]
-    # tgt wants t_size[t_axis_order[i]]
-    s_perm_size = s_size[s_axis_order]
-    t_perm_size = t_size[t_axis_order]
-    per_axis_scale = t_perm_size / np.maximum(s_perm_size, 1e-8)
-    # Apply scale as a diagonal matrix in the PERMUTED space, then un-permute
-    S_perm = np.diag(per_axis_scale).astype(np.float32)
-    P @ S_perm @ P.T  # rotate→scale→rotate back (but P.T=P^-1 since P orthogonal)
-    # Actually: we want T_final = scale_src_after_perm * permute
-    # T = P @ S where S is diag of per_axis_scale in src axis order
-    # Wait let me think again. We want:
-    #   output = P @ (per_axis_scale * src)
-    # So the rotation-scale matrix is P @ diag(per_axis_scale)
-    # But per_axis_scale is indexed by [s_axis_order], which is the scale
-    # applied to source axes AFTER permutation. So we need:
-    #   output_axis[i] = per_axis_scale[i] * src[s_axis_order[i]]
-    # In matrix form: output = P_unscale @ src, where:
-    #   P_unscale[i, s_axis_order[i]] = per_axis_scale[i]
-    P_scale = np.zeros((3, 3), dtype=np.float32)
-    for i in range(3):
-        P_scale[i, s_axis_order[i]] = per_axis_scale[i]
-    # Apply the sign flip too
-    if np.linalg.det(P) < 0:
-        # Adjust P_scale's last row sign
-        P_scale[-1, s_axis_order[-1]] *= -1.0
-    # Wait we already adjusted P separately. Let me redo this cleanly:
-    # The full transform: out = T_final @ src where T_final has:
-    #   - Axis permutation (with sign flip for proper rotation)
-    #   - Per-axis scaling
-    # Build as: T_final = P @ diag(s_perm_scale) @ reorder_back_to_src
-    # Simpler: directly construct T_final so that
-    #   out[t_axis_order[i]] = scale[i] * src[s_axis_order[i]]
-    T_final = np.zeros((3, 3), dtype=np.float32)
-    for i in range(3):
-        T_final[t_axis_order[i], s_axis_order[i]] = per_axis_scale[i]
-    # Apply sign flip if needed for proper rotation
-    if np.linalg.det(T_final) < 0:
-        T_final[t_axis_order[-1], s_axis_order[-1]] *= -1.0
-
-    T = np.eye(4, dtype=np.float32)
-    T[:3, :3] = T_final
-    T[:3, 3] = t_center - T_final @ s_center
-    return T
-
-
 def _aabb_align_uniform(src_pts: np.ndarray, tgt_pts: np.ndarray) -> np.ndarray:
     """Compute 4x4 transform mapping src_pts into tgt_pts's AABB.
 
@@ -395,72 +319,42 @@ def _aabb_align_uniform(src_pts: np.ndarray, tgt_pts: np.ndarray) -> np.ndarray:
     return T
 
 
-def _aabb_align_per_axis_safe(src_pts: np.ndarray, tgt_pts: np.ndarray) -> np.ndarray:
-    """Per-axis AABB alignment with smart thinnest-axis detection.
-
-    Combines the robust axis detection of ``_aabb_align_uniform`` (correctly
-    handles A-pose/T-pose characters where arm span may exceed height) with
-    **per-axis scaling** so that different body proportions — shoulder width,
-    arm length, torso depth — all match independently.
-
-    This is the correct alignment for barycentric weight correspondence:
-
-    - A source vertex at the shoulder tip maps to the template's shoulder
-      region, not the upper arm (which happens with uniform scale when
-      the source has wider shoulders than the template).
-    - A source vertex at the hand maps to the template's hand region, not
-      the forearm (which happens when the source has longer arms).
-
-    The uniform-scale approach (height ratio only) compresses or expands
-    ALL axes equally, causing proportional mismatch on non-average bodies
-    (children, muscular males, anime females, etc.).
-
-    Note: This produces non-uniform scale in the 3×3 matrix and should
-    ONLY be used for vertex correspondence (barycentric transfer), NOT for
-    bind matrix transforms (which need uniform scale for Blender compat).
-    """
-    s_min, s_max = src_pts.min(axis=0), src_pts.max(axis=0)
-    t_min, t_max = tgt_pts.min(axis=0), tgt_pts.max(axis=0)
-    s_center = (s_min + s_max) / 2
-    t_center = (t_min + t_max) / 2
-    s_size = np.maximum(s_max - s_min, 1e-8)
-    t_size = np.maximum(t_max - t_min, 1e-8)
-
-    # ── Smart axis detection (same logic as _aabb_align_uniform) ───────
-    # Use the thinnest axis (depth) to determine orientation. For standing
-    # characters this avoids misidentifying arm span as height.
-    s_thinnest = int(np.argmin(s_size))
-    t_thinnest = int(np.argmin(t_size))
-
-    if s_thinnest == t_thinnest:
-        # Same orientation — identity permutation, per-axis scale
-        per_axis_scale = (t_size / np.maximum(s_size, 1e-8)).astype(np.float32)
-        T_final = np.diag(per_axis_scale).astype(np.float32)
-    else:
-        # Different orientation (e.g., Z-up → Y-up) — permute + per-axis scale
-        s_axis_order = np.argsort(-s_size)  # largest first
-        t_axis_order = np.argsort(-t_size)
-        # Per-axis scale in permuted space
-        s_perm_size = s_size[s_axis_order]
-        t_perm_size = t_size[t_axis_order]
-        per_axis_scale_perm = (t_perm_size / np.maximum(s_perm_size, 1e-8)).astype(np.float32)
-        # Build T_final: out[t_axis_order[i]] = scale[i] * src[s_axis_order[i]]
-        T_final = np.zeros((3, 3), dtype=np.float32)
-        for i in range(3):
-            T_final[t_axis_order[i], s_axis_order[i]] = per_axis_scale_perm[i]
-        # Force proper rotation (det=+1)
-        if np.linalg.det(T_final) < 0:
-            T_final[t_axis_order[-1], s_axis_order[-1]] *= -1.0
-
-    T = np.eye(4, dtype=np.float32)
-    T[:3, :3] = T_final
-    T[:3, 3] = t_center - T_final @ s_center
-    return T
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # Main entry point
 # ═══════════════════════════════════════════════════════════════════════════
+
+# The numpy-side refusal gates. Measured on 14 standing + 9 refused real and
+# synthetic samples (calibration table ships with the pack wall): every standing
+# body reads mean aligned-surface distance <= 0.37 of body height, seated or
+# furniture-merged bodies >= 0.39; a part is worn when at least half its verts
+# sit within 6% of body height of the template surface.
+MEMBER_RADIUS = 0.06   # fraction of body height counting as "on the template surface"
+MEMBER_MIN = 0.5       # fraction of a part's verts on the surface for it to be skinned
+FIT_GATE_MAX = 0.45    # mean aligned-surface distance / body height above which the transfer refuses
+
+
+def _load_preflight():
+    """The stdlib judge rides beside this module; import it by file location so the
+    importlib-by-path load nodes.py performs still sees it."""
+    import sys
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import rig_preflight
+    return rig_preflight
+
+
+def _plan_stats(plan):
+    """The plan's measured numbers as flat report-row values (scalars, or JSON for containers)."""
+    return {
+        "leg_reach": round(float(plan["reach"]), 3),
+        "depth_over_height": round(float(plan["ratios"][0]), 3),
+        "lateral_over_height": round(float(plan["ratios"][1]), 3),
+        "facing": plan["facing"],
+        "thigh_extent": round(float(plan["stats"].get("thigh", 0.0)), 3),
+        "body_size_m": json.dumps([round(x, 3) for x in plan["size"]]),
+    }
+
 
 def transfer_soma_weights_and_write_glb(
     source_path: str,
@@ -468,29 +362,39 @@ def transfer_soma_weights_and_write_glb(
     max_influence_per_vertex: int = 4,
     preserve_texture: bool = True,
 ) -> str:
-    """Transfer SOMA template weights onto the source mesh, write GLB.
+    """Transfer SOMA template weights onto a STANDING humanoid, write GLB.
 
-    Uses NVIDIA SOMA-X's BarycentricInterpolator to transfer the SOMA-77
-    template's hand-painted skin weights onto the TRELLIS source mesh via
-    barycentric coordinate interpolation. This preserves the template's
-    anatomically-correct weight boundaries exactly — structurally
-    eliminating the torso/arm "wing" artifact that bone-heat smoothing
-    caused on raised-arm motions (wave, jumping_jacks).
+    The rig lane's executor. The stdlib judge (rig_preflight) reads the body
+    plan first — roles, facing and the standing gates — and anything that is
+    not a standing humanoid in rest pose (seated, kneeling, furniture-merged,
+    a scene block, an already-rigged or Draco-compressed mesh) is refused
+    with measured numbers BEFORE any geometry is touched. A Z-up scene is
+    converted to Y-up wholesale; worn parts are world-baked and re-seated as
+    identity scene roots; every other node keeps its place and its skin
+    nothing — scene integrity is absolute. Parts join the skin only when at
+    least half their verts lie on the aligned template surface (instanced
+    and off-body props stay exactly as authored), and the skinned union must
+    match the template within FIT_GATE_MAX mean surface distance.
+
+    The alignment is plan-driven: one signed permutation P (roles + facing)
+    with a per-axis full-box scale for the barycentric correspondence and a
+    uniform height-ratio scale for skeleton, IBMs and skin extras — the
+    poser's deform_custom reads somaT_alignRowMajor as linear = s·P.
 
     Args:
-        source_path: TRELLIS GLB (raw mesh, has POSITION + normals + texcoord
-            + material/texture, but NO skin weights). Must be in A-pose
-            (arms relaxed ~38° below horizontal) to match the SOMA template.
-        output_path: where to write the rigged GLB.
+        source_path: static GLB (POSITION [+ normals + texcoord + material],
+            no skins). Any standing rest pose — arms down, A-pose, T-pose —
+            is accepted; the plan measures it, nothing is assumed.
+        output_path: where to write the rigged GLB (a <stem>.report.json
+            sidecar lands beside it on success).
         max_influence_per_vertex: cap on joints per vertex (glTF JOINTS_0 is
             VEC4, so default 4).
         preserve_texture: when True (default), keep the source mesh's textures
             in the output. When False, strip all texture references from
-            materials and apply a flat SOMA-blue baseColorFactor — gives the
-            classic "blue mannequin" look so textures can be re-applied later
-            in Pose Studio or an external tool.
+            materials and apply a flat SOMA-blue baseColorFactor.
 
     Returns output_path.
+    Raises rig_preflight.RigRefusal on any gate, with the measured stats.
     """
     t0 = time.time()
     import torch
@@ -502,6 +406,7 @@ def transfer_soma_weights_and_write_glb(
     soma_lbs_idx = soma["lbs_indices"].astype(np.int32)          # (18056, 8)
     soma_lbs_w = soma["lbs_weights"].astype(np.float32)          # (18056, 8)
     soma_joint_names = list(soma["rig_joint_names"])             # 77
+    n_joints_soma = len(soma_joint_names)
     soma_bind = soma["bind_rig_transform"].astype(np.float32)    # (77, 4, 4)
     # UV layout ships WITH the pack (see SOMA_UV_PATH). Missing/mismatched
     # layout downgrades to no UV transfer (weights are unaffected) — the
@@ -520,44 +425,207 @@ def transfer_soma_weights_and_write_glb(
              len(soma_verts), len(soma_joint_names),
              soma_uv.shape if soma_uv is not None else None)
 
-    # ── Load source GLB ────────────────────────────────────────────────
-    gltf, bin_data = _read_glb(source_path)
-    prim = gltf["meshes"][0]["primitives"][0]
-    attrs = prim["attributes"]
-    src_pos = _read_accessor(gltf, bin_data, attrs["POSITION"]).astype(np.float32)
-    n_src = len(src_pos)
-    log.info("[soma_xfer] source: %d verts", n_src)
+    # ── Preflight: read the body plan (roles, facing, standing gates) ──
+    # The transfer refuses whatever the stdlib judge refuses, BEFORE any
+    # geometry is touched: a seated figure, a scene block, or furniture
+    # merged into the body gets a measured refusal, not a wrecked rig.
+    _pf = _load_preflight()
+    gltf, bin_data = _pf.parse_glb(source_path)
+    parts = _pf.parts_of_scene(gltf, bin_data)
+    plan = _pf.plan_for(_pf.cluster_around(parts, _pf.seed_part(parts)), bin_data)
+    if plan["violations"]:
+        raise _pf.RigRefusal(plan["violations"], stats=_plan_stats(plan))
+    log.info("[soma_xfer] plan: roles=%s facing=%s reach=%.2f ratios=%.2f/%.2f, cluster=%d part(s)",
+             plan["roles"], plan["facing"], plan["reach"],
+             plan["ratios"][0], plan["ratios"][1], len(plan["parts"]))
 
-    # ── AABB align SOMA → source ───────────────────────────────────────
-    # TWO separate transforms:
-    #
-    # 1. T_align_verts (PER-AXIS): Scales each axis independently so that
-    #    shoulder width, arm length, torso depth all match the source.
-    #    Used for barycentric correspondence — ensures source verts match
-    #    the correct template region. Without this, a character with wider
-    #    shoulders than the template gets shoulder verts matched to upper-
-    #    arm template verts → wrong weights → stretch artifacts.
-    #
-    # 2. T_align (UNIFORM): Height-ratio scale only. Used for bind matrices
-    #    + motion data alignment. Preserves uniform root bone scale so the
-    #    GLB writer's scale-stripping code works correctly.
-    T_align_verts = _aabb_align_per_axis_safe(soma_verts, src_pos)
-    soma_h = np.hstack([soma_verts, np.ones((len(soma_verts), 1), np.float32)])
-    soma_aligned = (T_align_verts @ soma_h.T).T[:, :3].astype(np.float32)
+    # ── Whole-scene Y-up conversion ────────────────────────────────────
+    # glTF is Y-up. A Z-up (or X-up) scene is converted wholesale — every
+    # node matrix and every POSITION/NORMAL/TANGENT — before any alignment,
+    # so no per-mesh height-axis guessing ever runs.
+    if plan["roles"]["up"] != _pf.UP_AXIS:
+        gltf, bin_data, _ = _pf.ensure_yup(gltf, bin_data, plan["roles"])
+        parts = _pf.parts_of_scene(gltf, bin_data)
+        plan = _pf.plan_for(_pf.cluster_around(parts, _pf.seed_part(parts)), bin_data)
+        if plan["violations"]:
+            raise _pf.RigRefusal(plan["violations"], stats=_plan_stats(plan))
+        log.info("[soma_xfer] scene converted to Y-up; plan re-read")
 
-    # Log scale ratios for diagnostics
-    _v_diag = np.diag(T_align_verts[:3, :3])
-    log.info("[soma_xfer] per-axis scale (verts): [%.3f, %.3f, %.3f]",
-             _v_diag[0], _v_diag[1], _v_diag[2])
+    # ── Bake worn parts to world space, re-seat them as scene roots ────
+    # glTF skinning ignores a skinned node's own transform, so worn parts
+    # carry their world transform in the vertices and sit as identity roots;
+    # every other node keeps its place. The scene root list is only ever
+    # grown — nothing is orphaned.
+    # Dedupe by node: a mesh with several primitives is ONE bake — the world
+    # snapshot inside bake_to_world is taken once, so a second pass would
+    # double-apply the transform.
+    old_nodes = list(dict.fromkeys(p["node"] for p in plan["parts"]))
+    gltf, bin_data, seats = _pf.bake_to_world(gltf, bin_data, old_nodes)
+    parts = _pf.parts_of_scene(gltf, bin_data)
+    seat_set = set(seats.values())
+    cluster = [p for p in parts if p["node"] in seat_set]  # every prim of a seat part
 
-    T_align = _aabb_align_uniform(soma_verts, src_pos)
+    # ── Plan-driven alignment ──────────────────────────────────────────
+    # ONE signed permutation P from the plan (roles + facing) and two scales:
+    # a per-axis full-box scale for the correspondence search (shoulder
+    # width, arm length, torso depth each match the source) and a uniform
+    # height-ratio scale for the skeleton, IBMs and skin extras — the
+    # poser's deform_custom reads somaT_alignRowMajor as linear = s·P, so
+    # that transform MUST stay uniform-scale × signed permutation.
+    P_rot = np.array(_pf.alignment_permutation(plan["roles"], plan["facing"] or 1), dtype=np.float64)
+    tv = soma_verts.astype(np.float64) @ P_rot.T
+    t_lo, t_hi = tv.min(axis=0), tv.max(axis=0)
+    s_lo, s_hi = np.array(plan["min"], dtype=np.float64), np.array(plan["max"], dtype=np.float64)
+    span = np.maximum(t_hi - t_lo, 1e-8)
+    pa = (s_hi - s_lo) / span                      # per-axis template→source scale
+    up = plan["roles"]["up"]
+    s_uniform = float(pa[up])                      # height-ratio scale
 
-    # Transform bind matrices with UNIFORM scale (Blender-compatible)
+    def _affine(diag_scale):
+        # row-vector affine: v' = (v @ P_rot.T) * diag_scale + shift
+        lin = np.diag(diag_scale) @ P_rot.T
+        shift = (s_lo + s_hi) / 2.0 - lin @ ((t_lo + t_hi) / 2.0)
+        m = np.eye(4, dtype=np.float64)
+        m[:3, :3] = lin
+        m[:3, 3] = shift
+        return m
+
+    T_align_verts = _affine(pa)                    # correspondence space
+    T_align = _affine(np.full(3, s_uniform))       # skeleton/extras: linear = s·P
+
+    soma_aligned = (soma_verts.astype(np.float64) @ T_align_verts[:3, :3].T
+                    + T_align_verts[:3, 3]).astype(np.float32)
     soma_bind_aligned = np.einsum("ij,njk->nik", T_align, soma_bind)
-    # Re-normalize the bottom row to [0,0,0,1]
     soma_bind_aligned[:, 3, :3] = 0.0
     soma_bind_aligned[:, 3, 3] = 1.0
+    body_height = float(s_hi[up] - s_lo[up])
+    log.info("[soma_xfer] per-axis scale (verts): [%.3f, %.3f, %.3f], uniform %.3f",
+             pa[0], pa[1], pa[2], s_uniform)
 
+    # ── Template face array + densified weights (once, shared by parts) ──
+    soma_faces = soma["faces"].astype(np.int64)
+    soma_dense_w = np.zeros((len(soma_verts), len(soma_joint_names)), dtype=np.float32)
+    for slot in range(soma_lbs_idx.shape[1]):
+        valid = soma_lbs_idx[:, slot] >= 0
+        np.add.at(
+            soma_dense_w,
+            (np.arange(len(soma_verts))[valid], soma_lbs_idx[valid, slot]),
+            soma_lbs_w[valid, slot],
+        )
+
+    # ── Membership + fit gate (the numpy-side second gate) ─────────────
+    # A part is SKINNED only when at least MEMBER_MIN of its verts lie within
+    # MEMBER_RADIUS of body height of the aligned template surface; instanced
+    # parts and props stay exactly as authored. The mean surface distance of
+    # the skinned union is the second refusal gate: a body whose measured
+    # shape cannot be the template's is refused, never skinned badly.
+    from scipy.spatial import cKDTree as _cKDTree
+    _e0 = soma_aligned[soma_faces[:, 0]]
+    _e1 = soma_aligned[soma_faces[:, 1]]
+    _e2 = soma_aligned[soma_faces[:, 2]]
+    surf_tree = _cKDTree(np.concatenate(
+        [soma_aligned, (_e0 + _e1) / 2.0, (_e1 + _e2) / 2.0, (_e0 + _e2) / 2.0,
+         (_e0 + _e1 + _e2) / 3.0]))
+    member_radius = MEMBER_RADIUS * body_height
+    skinned_parts, static_labels, best_frac = [], [], 0.0
+    for part in cluster:
+        pts = np.frombuffer(_pf.part_points(part, bin_data), dtype=np.float32).reshape(-1, 3)
+        d = surf_tree.query(pts)[0]
+        frac = float(np.mean(d < member_radius))
+        best_frac = max(best_frac, frac)
+        if part.get("instanced"):
+            static_labels.append(part["label"] + " (instanced, stays static)")
+        elif frac >= MEMBER_MIN:
+            part["_d"] = d
+            skinned_parts.append(part)
+        else:
+            static_labels.append("%s (%.0f%% on the template surface, stays static)"
+                                 % (part["label"], frac * 100.0))
+    if not skinned_parts:
+        raise _pf.RigRefusal(
+            ["no part of the mesh lies on the aligned template surface (best part %.0f%% within %.0f%% of body height)"
+             % (best_frac * 100.0, MEMBER_RADIUS * 100.0)],
+            stats=dict(_plan_stats(plan), body_height_m=round(body_height, 4)))
+    d_all = np.concatenate([p["_d"] for p in skinned_parts])
+    src_far = float(np.mean(d_all)) / body_height
+    if src_far > FIT_GATE_MAX:
+        raise _pf.RigRefusal(
+            ["the mesh does not match the humanoid template: mean surface distance %.2f of body height "
+             "(a standing body measures %.2f or less) — seated, kneeling, or furniture-merged"
+             % (src_far, FIT_GATE_MAX)],
+            stats=dict(_plan_stats(plan), body_height_m=round(body_height, 4),
+                       mean_surface_distance=round(src_far, 4)))
+    log.info("[soma_xfer] membership: %d skinned, %d static; mean surface distance %.3f of height",
+             len(skinned_parts), len(static_labels), src_far)
+
+    # ── Per-part weight transfer ───────────────────────────────────────
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    skinned_results = []
+    for part in skinned_parts:
+        pts = np.frombuffer(_pf.part_points(part, bin_data), dtype=np.float32).reshape(-1, 3)
+        prim_dict = gltf["meshes"][part["mesh"]]["primitives"][part["prim"]]
+        if "indices" in prim_dict:
+            faces = _read_accessor(gltf, bin_data, prim_dict["indices"]).reshape(-1, 3).astype(np.int64)
+        else:
+            faces = np.arange(len(pts), dtype=np.int64).reshape(-1, 3)
+        top_idx, top_w, uv = _transfer_weights_for_part(
+            pts, faces, soma_aligned, soma_faces, soma_dense_w,
+            soma_bind_aligned, soma_uv, n_joints_soma, soma_joint_names,
+            device, max_influence_per_vertex)
+        # part["mesh"]/part["prim"] are already the indices the writer needs.
+        skinned_results.append((part["node"], part["mesh"], part["prim"],
+                                top_idx.astype(np.uint16), top_w.astype(np.float32), uv))
+
+    # ── Build output GLB ───────────────────────────────────────────────
+    _write_rigged_glb(
+        source_gltf=gltf,
+        source_bin=bytes(bin_data),
+        skinned=[{"node": node, "mesh_index": mi, "prim_index": pi,
+                  "joints": ji, "weights": w, "src_uv": uv}
+                 for node, mi, pi, ji, w, uv in skinned_results],
+        soma_joint_names=soma_joint_names,
+        soma_bind_aligned=soma_bind_aligned,
+        output_path=output_path,
+        # T_align maps SOMA template space → source mesh space as linear = s·P. The
+        # server's deform_custom endpoint applies this to Kimodo's motion data (in
+        # SOMA template space) so the LBS World matrices match the IBM (computed in
+        # this aligned space).
+        t_align=T_align.astype(np.float32),
+        preserve_texture=preserve_texture,
+    )
+
+    stats = _plan_stats(plan)
+    stats.update({
+        "body_height_m": round(body_height, 4),
+        "skinned_parts": len(skinned_parts),
+        "static_parts": len(static_labels),
+        "static_labels": ", ".join(static_labels) or None,
+        "mean_surface_distance": round(src_far, 4),
+    })
+    try:
+        import report_sidecar
+        report_sidecar.write_report(output_path, True, [], stats)
+    except OSError as exc:
+        log.warning("[soma_xfer] %s", exc)
+
+    elapsed = time.time() - t0
+    log.info("[soma_xfer] complete in %.1fs → %s", elapsed, output_path)
+    return output_path
+
+
+def _transfer_weights_for_part(src_pos, src_faces, soma_aligned, soma_faces, soma_dense_w,
+                               soma_bind_aligned, soma_uv, n_joints_soma, soma_joint_names,
+                               device, max_influence_per_vertex=4):
+    """Region-constrained barycentric weight transfer for one part's WORLD-space verts.
+
+    src_pos (N,3) float32/64 world verts; src_faces (F,3) int64; soma_aligned is the
+    per-axis-aligned template; soma_bind_aligned the uniformly aligned binds. Returns
+    (top_idx (N,M) int64, top_w (N,M) float32, src_uv (N,2) float32 | None). The region
+    constraint, containment passes and smoothing are the single-mesh pipeline's, run
+    per part so worn geometry is weighted in the same correspondence space as the body.
+    """
+    import torch
+    n_src = len(src_pos)
     # ── Barycentric weight transfer (SOMA-X SOTA pipeline) ─────────────
     # For each source vert, find its containing triangle in the T_align'd
     # SOMA template mesh and interpolate the template's hand-painted
@@ -573,26 +641,6 @@ def transfer_soma_weights_and_write_glb(
     #   arm weight = 0.000000 vs bone-heat's 0.05+ (which dragged 2189
     #   torso verts >5cm during a 90° arm raise → the "wing" membrane).
     #   With barycentric: 1 vert >5cm (99.95% reduction).
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    n_joints_soma = len(soma_joint_names)
-
-    # 1. Densify template's sparse (18056, 8) → dense (18056, 77).
-    # The template stores top-8 influences per vert as parallel (idx, w)
-    # arrays. BarycentricInterpolator expects dense per-vertex attributes
-    # to interpolate, so we scatter the sparse weights into a (V, J) grid.
-    soma_faces = soma["faces"].astype(np.int64)
-    soma_dense_w = np.zeros((len(soma_verts), n_joints_soma), dtype=np.float32)
-    for slot in range(soma_lbs_idx.shape[1]):
-        valid = soma_lbs_idx[:, slot] >= 0
-        np.add.at(
-            soma_dense_w,
-            (np.arange(len(soma_verts))[valid], soma_lbs_idx[valid, slot]),
-            soma_lbs_w[valid, slot],
-        )
-    log.info("[soma_xfer] densified template weights: %s (row-sum range %.4f..%.4f)",
-             soma_dense_w.shape,
-             float(soma_dense_w.sum(axis=1).min()),
-             float(soma_dense_w.sum(axis=1).max()))
 
     # 2. Region-constrained correspondence (THE FIX for body horror) ──
     #
@@ -1121,16 +1169,6 @@ def transfer_soma_weights_and_write_glb(
     try:
         from scipy.sparse import csr_matrix
 
-        # Read source mesh faces for adjacency graph
-        if "indices" in prim:
-            src_faces = _read_accessor(gltf, bin_data, prim["indices"]).reshape(-1, 3).astype(np.int64)
-        else:
-            # Non-indexed primitive: generate sequential faces
-            n_src_verts = len(src_pos)
-            src_faces = np.arange(n_src_verts, dtype=np.int64).reshape(-1, 3)
-
-        # Build adjacency from faces
-        n_src = len(src_pos)
         rows = np.concatenate([src_faces[:,0], src_faces[:,1], src_faces[:,2],
                                src_faces[:,1], src_faces[:,2], src_faces[:,0]])
         cols = np.concatenate([src_faces[:,1], src_faces[:,2], src_faces[:,0],
@@ -1343,32 +1381,7 @@ def transfer_soma_weights_and_write_glb(
     top_w = np.nan_to_num(top_w, nan=0.0)
 
     log.info("[soma_xfer] weight interpolation complete (M=%d influences)", M)
-
-    # ── Build output GLB ───────────────────────────────────────────────
-    _write_rigged_glb(
-        source_gltf=gltf,
-        source_bin=bin_data,
-        source_pos=src_pos,
-        joints=top_idx.astype(np.uint16),
-        weights=top_w.astype(np.float32),
-        src_uv=src_uv,
-        soma_joint_names=soma_joint_names,
-        soma_bind_aligned=soma_bind_aligned,
-        output_path=output_path,
-        # T_align maps SOMA template space → source mesh space. The server's
-        # deform_custom endpoint applies this to Kimodo's motion data (which
-        # is in SOMA template space) so the LBS World matrices match the IBM
-        # (which was computed in source-aligned space = T_align(soma_bind)).
-        # Without this, the motion is in the wrong coordinate frame: Kimodo's
-        # ~1.7m-tall character with feet at Y=0 drives a ~1.0m-tall normalized
-        # mesh whose IBM expects Y-centered coords → body horror.
-        t_align=T_align.astype(np.float32),
-        preserve_texture=preserve_texture,
-    )
-
-    elapsed = time.time() - t0
-    log.info("[soma_xfer] complete in %.1fs → %s", elapsed, output_path)
-    return output_path
+    return top_idx, top_w, src_uv
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1378,25 +1391,25 @@ def transfer_soma_weights_and_write_glb(
 def _write_rigged_glb(
     source_gltf: dict,
     source_bin: bytes,
-    source_pos: np.ndarray,
-    joints: np.ndarray,           # (N, M) uint16 joint indices
-    weights: np.ndarray,          # (N, M) float32
+    skinned: list[dict],
     soma_joint_names: list[str],
     soma_bind_aligned: np.ndarray,  # (77, 4, 4) world bind matrices (aligned)
     output_path: str,
     t_align: np.ndarray | None = None,  # (4, 4) SOMA-template → source-mesh transform
     preserve_texture: bool = True,
-    src_uv: np.ndarray | None = None,    # (N, 2) somax-layout UVs for the source verts
 ) -> None:
-    """Write a new GLB = source geometry/textures + skin weights + armature.
+    """Write a new GLB: the source scene with EVERY node kept, skin weights on the skinned
+    parts, and the SOMA-Mixamo armature.
 
-    When preserve_texture=False, strips every material's texture references
-    and replaces them with a flat SOMA-blue baseColorFactor. Geometry, skin,
-    and armature are unchanged — this is purely a material/texture swap so
-    the character can be re-textured later in Pose Studio or another tool.
+    skinned carries one entry per skinned part: {"node": identity-TRS scene root (the
+    preflight bake seat), "mesh_index"/"prim_index": the primitive receiving JOINTS_0 /
+    WEIGHTS_0, "joints": (N, M) uint16, "weights": (N, M) float32, "src_uv": (N, 2) | None}.
+    Static props pass through untouched; the scene root list is grown, never replaced, so
+    nothing is orphaned. Coordinate frames need no guessing here: the preflight converted
+    the scene to Y-up and baked the worn parts to world space before this runs.
     """
-    n_verts = len(source_pos)
     n_joints_soma = len(soma_joint_names)
+    total_verts = sum(len(e["joints"]) for e in skinned)
 
     # Build the joint name list (Mixamo-renamed) and parent hierarchy
     joint_names_mix = [SOMA_IDX_TO_MIXAMO_NAME.get(i, f"SOMA_{i}")
@@ -1412,78 +1425,6 @@ def _write_rigged_glb(
     gltf = json.loads(json.dumps(source_gltf))  # deep copy
     src_buffer = gltf.get("buffers", [{}])[0]
     src_byte_length = src_buffer.get("byteLength", len(source_bin))
-
-    # ── Ensure Y-up output (glTF standard) ────────────────────────────
-    # The source mesh (TRELLIS) may be in Z-up. The AABB alignment may
-    # put bones in Z-up too. glTF REQUIRES all data in Y-up.
-    # We detect the mesh height axis and convert EVERYTHING to Y-up if
-    # the mesh is not already Y-up.
-    prim_ref = gltf["meshes"][0]["primitives"][0]
-    attrs_ref = prim_ref.get("attributes", {})
-    pos_acc_idx_ref = attrs_ref.get("POSITION")
-
-    _need_yup_fix = False
-    if pos_acc_idx_ref is not None:
-        pos_acc_ref = gltf["accessors"][pos_acc_idx_ref]
-        pos_min = pos_acc_ref.get("min", [0, 0, 0])
-        pos_max = pos_acc_ref.get("max", [0, 0, 0])
-        mesh_spreads = [pos_max[i] - pos_min[i] for i in range(3)]
-        mesh_height = max(range(3), key=lambda i: mesh_spreads[i])
-
-        if mesh_height == 2:  # Z-up — need to convert to Y-up
-            _need_yup_fix = True
-            log.info("[soma_xfer] converting Z-up → Y-up for glTF output")
-
-            # ── Convert mesh POSITION + NORMAL in the binary ──
-            _src_bin_mutable = bytearray(source_bin[:src_byte_length])
-
-            # POSITION: Z-up → Y-up = (x, y, z) → (x, z, -y)
-            # This maps +Z (up in Z-up) to +Y (up in Y-up).
-            pos_bv = gltf["bufferViews"][pos_acc_ref["bufferView"]]
-            pos_off = pos_bv.get("byteOffset", 0) + pos_acc_ref.get("byteOffset", 0)
-            pos_count = pos_acc_ref["count"]
-            pos_bytes = pos_count * 3 * 4
-            pos_data = np.frombuffer(bytes(_src_bin_mutable[pos_off:pos_off + pos_bytes]),
-                                      dtype=np.float32).reshape(pos_count, 3).copy()
-            new_pos = np.column_stack([pos_data[:, 0], pos_data[:, 2], -pos_data[:, 1]]).astype(np.float32)
-            _src_bin_mutable[pos_off:pos_off + pos_bytes] = new_pos.tobytes()
-            pos_acc_ref["min"] = [float(new_pos[:, i].min()) for i in range(3)]
-            pos_acc_ref["max"] = [float(new_pos[:, i].max()) for i in range(3)]
-
-            # NORMAL: same rotation
-            nrm_acc_idx = attrs_ref.get("NORMAL")
-            if nrm_acc_idx is not None:
-                nrm_acc = gltf["accessors"][nrm_acc_idx]
-                nrm_bv = gltf["bufferViews"][nrm_acc["bufferView"]]
-                nrm_off = nrm_bv.get("byteOffset", 0) + nrm_acc.get("byteOffset", 0)
-                nrm_count = nrm_acc["count"]
-                nrm_bytes = nrm_count * 3 * 4
-                nrm_data = np.frombuffer(bytes(_src_bin_mutable[nrm_off:nrm_off + nrm_bytes]),
-                                          dtype=np.float32).reshape(nrm_count, 3).copy()
-                new_nrm = np.column_stack([nrm_data[:, 0], nrm_data[:, 2], -nrm_data[:, 1]]).astype(np.float32)
-                _src_bin_mutable[nrm_off:nrm_off + nrm_bytes] = new_nrm.tobytes()
-
-            source_bin = bytes(_src_bin_mutable)
-
-            # ── Convert soma_bind_aligned from Z-up to Y-up ──
-            # LEFT-MULTIPLY by P4 (not conjugation). This transforms the
-            # world-space bone matrices to Y-up, same as the mesh vertices.
-            # The root bone's local transform gets the P4 rotation, which
-            # correctly maps child local-Z translations to world +Y (up).
-            P4 = np.array([
-                [1, 0, 0, 0],
-                [0, 0, 1, 0],
-                [0, -1, 0, 0],
-                [0, 0, 0, 1]
-            ], dtype=np.float64)
-            soma_bind_aligned = np.array([
-                P4 @ m.astype(np.float64)
-                for m in soma_bind_aligned
-            ], dtype=np.float32)
-        else:
-            log.info("[soma_xfer] mesh already Y-up — no coordinate fix needed")
-
-    # ── IBM computed AFTER scale stripping (see below) ──
 
     # Pad source bin to 4-byte alignment
     pad = (4 - (src_byte_length % 4)) % 4
@@ -1522,58 +1463,45 @@ def _write_rigged_glb(
         gltf.setdefault("accessors", []).append(acc)
         return len(gltf["accessors"]) - 1
 
-    # ── JOINTS_0 (uint16 vec4) ─────────────────────────────────────────
-    joints_bytes = joints.astype(np.uint16).tobytes()
-    bv_j = add_bufferView(joints_bytes)
-    acc_j = add_accessor(bv_j, n_verts, "VEC4", 5123,
-                          mins=[int(joints.min())],
-                          maxs=[int(joints.max())])
-
-    # ── WEIGHTS_0 (float32 vec4) ───────────────────────────────────────
-    weights_bytes = weights.astype(np.float32).tobytes()
-    bv_w = add_bufferView(weights_bytes)
-    acc_w = add_accessor(bv_w, n_verts, "VEC4", 5126,
-                          mins=[0.0, 0.0, 0.0, 0.0],
-                          maxs=[1.0, 1.0, 1.0, 1.0])
-
-    # Add JOINTS_0 + WEIGHTS_0 to mesh primitive
-    prim = gltf["meshes"][0]["primitives"][0]
-    prim["attributes"]["JOINTS_0"] = acc_j
-    prim["attributes"]["WEIGHTS_0"] = acc_w
-
-    # ── TEXCOORD_0 (float32 vec2, somax layout) ────────────────────────
-    # Only when the source primitive has NO UVs of its own: a body that
-    # arrives with UVs keeps them (its textures live in that space). The
-    # somax layout spans beyond [0,1] (tiled atlas) — min/max stated from
-    # the data, never clamped.
-    if src_uv is not None and "TEXCOORD_0" not in prim["attributes"]:
-        uv_bytes = src_uv.astype(np.float32).tobytes()
-        bv_uv = add_bufferView(uv_bytes)
-        acc_uv = add_accessor(bv_uv, n_verts, "VEC2", 5126,
-                              mins=[float(src_uv[:, 0].min()), float(src_uv[:, 1].min())],
-                              maxs=[float(src_uv[:, 0].max()), float(src_uv[:, 1].max())])
-        prim["attributes"]["TEXCOORD_0"] = acc_uv
-
-    # ── IBM buffer created later, after scale-stripping + FK recompute ──
+    # ── Per-part JOINTS_0 / WEIGHTS_0 / somax UV ───────────────────────
+    # Every skinned part's primitive receives its own attributes; static
+    # props are never touched. TEXCOORD_0 lands only where the source
+    # primitive has no UVs of its own (the somax layout spans a tiled
+    # atlas beyond [0,1]; min/max stated from the data, never clamped).
+    for entry in skinned:
+        prim = gltf["meshes"][entry["mesh_index"]]["primitives"][entry["prim_index"]]
+        n_part = len(entry["joints"])
+        bv_j = add_bufferView(entry["joints"].astype(np.uint16).tobytes())
+        acc_j = add_accessor(bv_j, n_part, "VEC4", 5123,
+                             mins=[int(entry["joints"].min())],
+                             maxs=[int(entry["joints"].max())])
+        bv_w = add_bufferView(entry["weights"].astype(np.float32).tobytes())
+        acc_w = add_accessor(bv_w, n_part, "VEC4", 5126,
+                             mins=[0.0, 0.0, 0.0, 0.0],
+                             maxs=[1.0, 1.0, 1.0, 1.0])
+        prim["attributes"]["JOINTS_0"] = acc_j
+        prim["attributes"]["WEIGHTS_0"] = acc_w
+        if entry.get("src_uv") is not None and "TEXCOORD_0" not in prim["attributes"]:
+            uv = entry["src_uv"]
+            bv_uv = add_bufferView(uv.astype(np.float32).tobytes())
+            acc_uv = add_accessor(bv_uv, n_part, "VEC2", 5126,
+                                  mins=[float(uv[:, 0].min()), float(uv[:, 1].min())],
+                                  maxs=[float(uv[:, 0].max()), float(uv[:, 1].max())])
+            prim["attributes"]["TEXCOORD_0"] = acc_uv
 
     # ── Build nodes hierarchy ──────────────────────────────────────────
-    # Existing nodes might include mesh node. We need to:
-    #   1. Add n_joints_soma new nodes (the bones)
-    #   2. Set parent-child relationships via the "children" field
-    #   3. Attach the mesh node to the root bone (Hips) — actually glTF
-    #      uses a SKIN attached to the mesh node, not a parent link.
-    #   4. Set each bone's translation + rotation from local matrices
+    # The bone nodes, the Armature wrapper and the skin are APPENDED to the
+    # scene graph; every source node keeps its place.
 
     existing_node_count = len(gltf.get("nodes", []))
     scenes = gltf.get("scenes", [{"nodes": []}])
-    root_node = scenes[0].get("nodes", [None])[0]
 
     # Compute local transforms: local = inv(parent_world) @ world
     # For root (Hips): local = world
     bone_node_idxs = []
     local_transforms: list[tuple[list[float], list[float], list[float]]] = []  # (t, r, s)
 
-    # Track the uniform scale from the root bone (AABB alignment)
+    # Track the uniform scale from the root bone (alignment)
     _root_uniform_scale: float | None = None
 
     for i in range(n_joints_soma):
@@ -1602,7 +1530,7 @@ def _write_rigged_glb(
 
         if parent_idx is None:
             # Root bone: capture the uniform scale for stripping.
-            # AABB alignment uses uniform scale, so all 3 norms ≈ same.
+            # Alignment is uniform-scale × permutation, so all 3 norms ≈ same.
             _root_uniform_scale = float(np.mean(col_norms))
 
         local_transforms.append((
@@ -1695,13 +1623,14 @@ def _write_rigged_glb(
     gltf.setdefault("nodes", []).append(armature_node)
     armature_node_idx = len(gltf["nodes"]) - 1
 
-    # Attach armature to scene
+    # Attach armature to the first scene (every scene holding a skinned seat
+    # gets it below; scenes without the character never see the bones).
     if "nodes" not in scenes[0]:
         scenes[0]["nodes"] = []
     if armature_node_idx not in scenes[0]["nodes"]:
         scenes[0]["nodes"].append(armature_node_idx)
 
-    # Attach skin to the mesh node
+    # Attach skin to the skinned seats
     skin_idx = len(gltf.setdefault("skins", []))
     skin_dict: dict[str, Any] = {
         "joints": bone_node_idxs,
@@ -1719,56 +1648,26 @@ def _write_rigged_glb(
             "somaT_alignRowMajor": [float(x) for x in np.asarray(t_align).reshape(16)],
         }
     gltf["skins"].append(skin_dict)
-    # Find the mesh node (it's the existing one with a "mesh" attribute)
-    mesh_node_idx = root_node
-    if mesh_node_idx is None or "mesh" not in gltf["nodes"][mesh_node_idx]:
-        for ni, node in enumerate(gltf.get("nodes", [])):
-            if "mesh" in node:
-                mesh_node_idx = ni
-                break
 
-    if mesh_node_idx is not None:
-        # The mesh node references the skin (drives deformation)
-        gltf["nodes"][mesh_node_idx]["skin"] = skin_idx
-
-        # Per glTF 2.0 spec: when a node is skinned, its world transform is
-        # ignored. Set identity to avoid any confusion.
-        gltf["nodes"][mesh_node_idx]["translation"] = [0.0, 0.0, 0.0]
-        gltf["nodes"][mesh_node_idx]["rotation"] = [0.0, 0.0, 0.0, 1.0]
-        gltf["nodes"][mesh_node_idx]["scale"] = [1.0, 1.0, 1.0]
-
-        # Ensure the mesh node is a DIRECT scene root — a sibling of the
-        # Armature, NOT a child of any bone or wrapper. Blender's glTF
-        # importer asserts that skinned mesh nodes are not bone descendants,
-        # and Three.js requires the mesh to be reachable from exactly ONE
-        # scene-graph position.
-        #
-        # CRITICAL: glTF forbids a node from being BOTH a child of another
-        # node AND a direct scene root. If the source GLB wrapped its mesh
-        # in a transform node (TRELLIS emits a "world" → "geometry_0"
-        # hierarchy), we MUST detach the mesh from its parent before
-        # promoting it to a scene root. Without this, the mesh appears in
-        # TWO positions in the scene graph — Three.js creates a duplicate
-        # SkinnedMesh for the orphaned scene-root instance, and that copy's
-        # skeleton never binds (bones resolve to undefined), crashing with
-        # "Cannot read properties of undefined (reading 'matrixWorld')" on
-        # the first bounding-box / render call.
-        for parent_node in gltf.get("nodes", []):
-            kids = parent_node.get("children")
-            if kids and mesh_node_idx in kids:
-                parent_node["children"] = [c for c in kids if c != mesh_node_idx]
-                if not parent_node["children"]:
-                    del parent_node["children"]
-
-        # The scene contains exactly two roots: Armature (holds the bone
-        # hierarchy) and the mesh node (holds geometry + skin reference).
-        # Any source wrapper nodes (e.g., TRELLIS's "world") are dropped —
-        # they contributed only transform, which glTF ignores for skinned
-        # meshes anyway.
-        scenes[0]["nodes"] = [armature_node_idx, mesh_node_idx]
+    # ── Reference the skin from every skinned seat; grow the scene roots ──
+    # The preflight bake already seats the worn parts as identity scene
+    # roots; the skin reference and the Armature are ADDED. The old writer's
+    # scenes[0]["nodes"] = [armature, mesh] rewrite orphaned every other node
+    # — gone: scene integrity is absolute.
+    for entry in skinned:
+        node = gltf["nodes"][entry["node"]]
+        node["skin"] = skin_idx
+        # glTF ignores a skinned node's own transform; make that explicit.
+        node["translation"] = [0.0, 0.0, 0.0]
+        node["rotation"] = [0.0, 0.0, 0.0, 1.0]
+        node["scale"] = [1.0, 1.0, 1.0]
+    for scene in gltf.get("scenes") or []:
+        if any(entry["node"] in (scene.get("nodes") or []) for entry in skinned):
+            if armature_node_idx not in scene["nodes"]:
+                scene["nodes"].append(armature_node_idx)
 
     # Update buffer
-    gltf["buffers"][0]["byteLength"] = len(new_bin)
+    gltf.setdefault("buffers", [{}])[0]["byteLength"] = len(new_bin)
 
     # ── Optionally strip textures for a flat SOMA-blue mannequin ────────
     # When preserve_texture=False, replace every material with a flat
@@ -1823,8 +1722,8 @@ def _write_rigged_glb(
         f.write(struct.pack("<II", len(bin_padded), 0x004E4942))
         f.write(bin_padded)
 
-    log.info("[soma_xfer] wrote GLB: %d verts, %d bones, %d KB",
-             n_verts, n_joints_soma, os.path.getsize(output_path) // 1024)
+    log.info("[soma_xfer] wrote GLB: %d skinned verts, %d bones, %d KB",
+             total_verts, n_joints_soma, os.path.getsize(output_path) // 1024)
 
 
 def _trs_to_mat4(t: list[float], q: list[float], s: list[float]) -> np.ndarray:
